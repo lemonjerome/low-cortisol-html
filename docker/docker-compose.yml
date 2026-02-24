@@ -1,0 +1,16 @@
+services:
+  compilot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: compilot-agent
+    working_dir: /app
+    volumes:
+      - ..:/app
+    environment:
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      WORKSPACE_ROOT: ""
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    stdin_open: true
+    tty: true

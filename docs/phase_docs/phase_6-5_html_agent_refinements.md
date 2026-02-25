@@ -1,7 +1,7 @@
-# Phase 7 — HTML Agent Refinements
+# Phase 6.5 — HTML Agent Refinements
 
 ## Objective
-Finalize the HTML/CSS/JS-first agent workflow with stronger planning structure, reliable tool invocation, and stable completion behavior.
+Strengthen the HTML/CSS/JS-first agent workflow with improved planning structure, reliable tool invocation, and stable completion behavior.
 
 ## Functional Changes
 1. Expanded planning structure for purpose, features, visual direction, interaction model, tests, and development phases.
@@ -19,12 +19,6 @@ Registered in `mcp_server/server.py`:
 - `run_unit_tests`
 - `plan_web_build`
 - `dummy_sandbox_echo`
-
-Implemented in `mcp_server/tools/web_tools.py`:
-- `scaffold_web_app_tool`
-- `validate_web_app_tool`
-- `run_unit_tests_tool`
-- `plan_web_build_tool`
 
 ## Reasoning and Loop Updates
 - Planner (`orchestrator/planner.py`) emits structured fields:

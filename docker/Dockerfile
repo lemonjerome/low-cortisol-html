@@ -15,4 +15,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN python -m pip install --no-cache-dir --upgrade pip
 
-CMD ["python", "-m", "http.server", "8000"]
+CMD ["python", "ui/server.py"]

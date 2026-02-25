@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Low Cortisol HTML</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-left">
+        <button id="openHtmlBtn" class="btn">Open HTML</button>
+      </div>
+      <div class="topbar-title">Low Cortisol HTML</div>
+      <div class="topbar-right">
+        <button id="newProjectBtn" class="btn">New Project</button>
+        <button id="openProjectBtn" class="btn">Open Project</button>
+        <button id="clearChatBtn" class="btn danger">Clear Chat</button>
+      </div>
+    </header>
+
+    <main class="columns">
+      <section class="column actions-column">
+        <h2>Actions</h2>
+        <div id="actionsStream" class="stream"></div>
+      </section>
+      <section class="column reasoning-column">
+        <h2>Reasoning / Thinking / Debugging</h2>
+        <div id="reasoningStream" class="stream mono"></div>
+      </section>
+      <section class="column chat-column">
+        <h2>Chat</h2>
+        <div id="chatStream" class="chat-stream"></div>
+        <form id="chatForm" class="chat-form">
+          <textarea id="chatInput" rows="3" placeholder="Type your request..."></textarea>
+          <button id="sendBtn" type="submit" class="btn primary">Send</button>
+        </form>
+      </section>
+    </main>
+
+    <div id="startupModal" class="modal-backdrop visible">
+      <div class="modal">
+        <h3>Workspace Root</h3>
+        <p>Set the absolute parent directory for LCH workspaces before starting.</p>
+        <label class="field-label">Workspace parent directory</label>
+        <div class="input-row">
+          <input id="startupRootInput" type="text" />
+          <button id="startupChooseBtn" class="btn">Choose</button>
+        </div>
+        <div class="modal-actions">
+          <button id="startupValidateBtn" class="btn primary">Validate & Continue</button>
+        </div>
+        <div id="startupError" class="error"></div>
+      </div>
+    </div>
+
+    <div id="newProjectModal" class="modal-backdrop">
+      <div class="modal">
+        <h3>New Project</h3>
+        <label class="field-label">Parent directory</label>
+        <div class="input-row">
+          <input id="newParentInput" type="text" />
+          <button id="newParentChooseBtn" class="btn">Choose</button>
+        </div>
+        <label class="field-label">Workspace folder name</label>
+        <input id="newWorkspaceName" type="text" value="lch_new_project" />
+        <div class="modal-actions">
+          <button id="newProjectCancel" class="btn">Cancel</button>
+          <button id="newProjectCreate" class="btn primary">Create</button>
+        </div>
+        <div id="newProjectError" class="error"></div>
+      </div>
+    </div>
+
+    <div id="openProjectModal" class="modal-backdrop">
+      <div class="modal">
+        <h3>Open Project</h3>
+        <label class="field-label">Project absolute path</label>
+        <div class="input-row">
+          <input id="openProjectPath" type="text" />
+          <button id="openProjectChoose" class="btn">Choose</button>
+        </div>
+        <div class="modal-actions">
+          <button id="openProjectCancel" class="btn">Cancel</button>
+          <button id="openProjectConfirm" class="btn primary">Open</button>
+        </div>
+        <div id="openProjectError" class="error"></div>
+      </div>
+    </div>
+
+    <div id="clearChatModal" class="modal-backdrop">
+      <div class="modal">
+        <h3>Clear Chat</h3>
+        <p>This clears chat history and in-memory context for this session.</p>
+        <div class="modal-actions">
+          <button id="clearChatCancel" class="btn">Cancel</button>
+          <button id="clearChatConfirm" class="btn danger">Clear</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/script.js"></script>
+  </body>
+</html>

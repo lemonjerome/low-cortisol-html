@@ -7,11 +7,10 @@ from typing import Any
 
 from tool_registry import ToolDefinition, ToolRegistry
 from tools.action_logger import log_tool_action
-from tools.compiler_tools import clean_build_tool, compile_c_tool, run_binary_tool
 from tools.dummy_tools import sandbox_echo_path
 from tools.file_tools import create_file_tool, list_directory_tool, read_file_tool
-from tools.flex_bison_tools import generate_lexer_tool, generate_parser_tool, link_compiler_tool
 from tools.sandbox import resolve_workspace_root
+from tools.web_tools import plan_web_build_tool, run_unit_tests_tool, scaffold_web_app_tool, validate_web_app_tool
 
 
 def _build_registry(workspace_root: str) -> ToolRegistry:
@@ -103,118 +102,79 @@ def _build_registry(workspace_root: str) -> ToolRegistry:
 
     registry.register(
         ToolDefinition(
-            name="compile_c",
-            description="Compile C sources within workspace using guarded compiler flags and timeout.",
+            name="scaffold_web_app",
+            description="Create a minimal HTML/CSS/JS app scaffold for a concept prototype.",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "source_files": {"type": "array", "items": {"type": "string"}},
-                    "output_binary": {"type": "string"},
-                    "cflags": {"type": "array", "items": {"type": "string"}},
-                    "timeout_seconds": {"type": "integer"},
+                    "app_dir": {"type": "string"},
+                    "app_title": {"type": "string"},
                 },
-                "required": ["source_files"],
-                "additionalProperties": False,
-            },
-            handler=with_logging("compile_c", lambda arguments: compile_c_tool(arguments, resolved_workspace)),
-        )
-    )
-
-    registry.register(
-        ToolDefinition(
-            name="run_binary",
-            description="Execute a workspace binary with argument/timeout constraints.",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "binary_path": {"type": "string"},
-                    "args": {"type": "array", "items": {"type": "string"}},
-                    "timeout_seconds": {"type": "integer"},
-                },
-                "required": ["binary_path"],
-                "additionalProperties": False,
-            },
-            handler=with_logging("run_binary", lambda arguments: run_binary_tool(arguments, resolved_workspace)),
-        )
-    )
-
-    registry.register(
-        ToolDefinition(
-            name="clean_build",
-            description="Remove build files/directories in workspace only.",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "targets": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": [],
-                "additionalProperties": False,
-            },
-            handler=with_logging("clean_build", lambda arguments: clean_build_tool(arguments, resolved_workspace)),
-        )
-    )
-
-    registry.register(
-        ToolDefinition(
-            name="generate_lexer",
-            description="Generate C lexer output from a flex file inside workspace.",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "lex_file": {"type": "string"},
-                    "output_c": {"type": "string"},
-                    "timeout_seconds": {"type": "integer"},
-                },
-                "required": ["lex_file"],
+                "required": ["app_dir"],
                 "additionalProperties": False,
             },
             handler=with_logging(
-                "generate_lexer",
-                lambda arguments: generate_lexer_tool(arguments, resolved_workspace),
+                "scaffold_web_app",
+                lambda arguments: scaffold_web_app_tool(arguments, resolved_workspace),
             ),
         )
     )
 
     registry.register(
         ToolDefinition(
-            name="generate_parser",
-            description="Generate parser C/header outputs from a bison grammar inside workspace.",
+            name="validate_web_app",
+            description="Validate required HTML/CSS/JS files and link references for local browser run.",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "grammar_file": {"type": "string"},
-                    "output_c": {"type": "string"},
-                    "output_h": {"type": "string"},
-                    "timeout_seconds": {"type": "integer"},
+                    "app_dir": {"type": "string"},
                 },
-                "required": ["grammar_file"],
+                "required": ["app_dir"],
                 "additionalProperties": False,
             },
             handler=with_logging(
-                "generate_parser",
-                lambda arguments: generate_parser_tool(arguments, resolved_workspace),
+                "validate_web_app",
+                lambda arguments: validate_web_app_tool(arguments, resolved_workspace),
             ),
         )
     )
 
     registry.register(
         ToolDefinition(
-            name="link_compiler",
-            description="Link C sources into a compiler binary inside workspace.",
+            name="run_unit_tests",
+            description="Run plain JavaScript unit tests (Node.js) for the generated web concept.",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "source_files": {"type": "array", "items": {"type": "string"}},
-                    "output_binary": {"type": "string"},
-                    "extra_flags": {"type": "array", "items": {"type": "string"}},
+                    "test_file": {"type": "string"},
                     "timeout_seconds": {"type": "integer"},
                 },
-                "required": ["source_files"],
+                "required": ["test_file"],
                 "additionalProperties": False,
             },
             handler=with_logging(
-                "link_compiler",
-                lambda arguments: link_compiler_tool(arguments, resolved_workspace),
+                "run_unit_tests",
+                lambda arguments: run_unit_tests_tool(arguments, resolved_workspace),
+            ),
+        )
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="plan_web_build",
+            description="Generate a concrete phased development plan for the HTML/CSS/JS concept app.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "prompt_features": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["summary"],
+                "additionalProperties": False,
+            },
+            handler=with_logging(
+                "plan_web_build",
+                lambda arguments: plan_web_build_tool(arguments, resolved_workspace),
             ),
         )
     )

@@ -2,7 +2,7 @@
 
 ## What was built in this phase
 
-This phase established a containerized, open-source runtime foundation for the local MCP-based coding agent project.
+This phase established a containerized, open-source runtime foundation for the local MCP-based HTML coding agent project.
 
 Implemented deliverables:
 
@@ -27,18 +27,16 @@ Purpose:
 - Defines a reproducible, open-source runtime image for orchestrator + MCP server development.
 
 Key design choices:
-- Base image: `python:3.11-slim` (open-source, lightweight, suitable for upcoming Python services).
-- Installs compiler toolchain dependencies required by the roadmap:
-  - `gcc`, `clang`, `make`, `build-essential`
-  - `flex`, `bison`
-  - `gdb` for debug tooling support
-  - `git`, `curl`, `ca-certificates` for local development utilities
+- Base image: `python:3.11-slim` (open-source, lightweight, suitable for orchestrator + MCP services).
+- Installs web-workflow dependencies required by the roadmap:
+   - `nodejs`, `npm` for local JavaScript unit tests
+   - `git`, `curl`, `ca-certificates` for local development utilities
 - Uses `PYTHONDONTWRITEBYTECODE` and `PYTHONUNBUFFERED` for cleaner container behavior.
 - Sets `/app` as working directory and upgrades `pip`.
 
 How it supports later phases:
-- Provides required binaries for compiler and Flex/Bison tool implementations.
 - Provides Python runtime needed for MCP server and orchestrator modules.
+- Provides Node.js runtime needed for plain JS test execution in generated HTML concepts.
 
 ### 2) `docker/docker-compose.yml`
 
@@ -80,7 +78,7 @@ Runtime interaction model established in Phase 1:
 4. Those services can call Ollama on the host through `host.docker.internal:11434`.
 5. Workspace remains undefined at boot and is intended to be provided later by UI validation flow.
 
-This keeps the base infrastructure ready while respecting the project’s future guardrail and workspace requirements.
+This keeps the base infrastructure ready while respecting guardrail and workspace requirements.
 
 ## Open-source and cost compliance
 
@@ -88,8 +86,7 @@ All technologies selected in this phase are free and open-source:
 
 - Docker / Docker Compose
 - Python (official OSS image)
-- GNU toolchain components and OSS compiler/debug utilities
-- Flex and Bison
+- Node.js and npm
 
 No paid APIs, proprietary SDKs, or commercial services were introduced.
 
@@ -106,4 +103,4 @@ Recommended checks:
 4. Optional Ollama connectivity test from container (when Ollama is running on host):
    - `curl http://host.docker.internal:11434/api/tags`
 
-These checks verify that the container can boot independently of workspace selection and is prepared for subsequent phases.
+These checks verify that the container can boot independently of workspace selection and is prepared for subsequent web-agent phases.

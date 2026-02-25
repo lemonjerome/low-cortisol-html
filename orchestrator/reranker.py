@@ -56,6 +56,8 @@ class ToolReranker:
             model=self.model_name,
             messages=[{"role": "user", "content": prompt}],
             tools=[],
+            stream=True,
+            stream_label="reranker",
         )
         message = self.ollama_client.extract_assistant_message(response)
         content = str(message.get("content", ""))

@@ -17,7 +17,7 @@ from tool_pruner import ToolPruner
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Phase 6 orchestrator with reason-create-debug loop")
+    parser = argparse.ArgumentParser(description="Low-cortisol-html orchestrator with phased reasoning and web concept build loop")
     parser.add_argument("--workspace-root", required=True, help="Absolute workspace path")
     parser.add_argument("--task", required=True, help="User task prompt")
     parser.add_argument("--model", default="qwen2.5-coder:14b", help="Ollama model name")
@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "mps", "cuda", "cpu"],
         help="Compute backend selection policy",
     )
-    parser.add_argument("--max-loops", type=int, default=5, help="Maximum orchestrator iterations")
+    parser.add_argument("--max-loops", type=int, default=10, help="Maximum orchestrator iterations")
     return parser.parse_args()
 
 
@@ -51,7 +51,7 @@ def main() -> int:
     vectors_path = project_root / "embeddings" / "tool_vectors.json"
     pruning_log_path = project_root / "logs" / "tool_pruning.log"
     device_info = detect_compute_backend(args.device)
-    os.environ["COMPILOT_DEVICE"] = device_info["device"]
+    os.environ["LOW_CORTISOL_HTML_DEVICE"] = device_info["device"]
 
     client = OllamaClient(base_url=ollama_base_url)
     preload = client.ensure_models_loaded([args.model, args.embedding_model])
@@ -88,7 +88,7 @@ def main() -> int:
         json.dumps(
             {
                 "ok": True,
-                "phase": "phase_6_reason_create_debug_loop",
+                "phase": "phase_7_low_cortisol_html_pivot",
                 "ollama_base_url": ollama_base_url,
                 "ollama_health": health,
                 "model_preload": preload,

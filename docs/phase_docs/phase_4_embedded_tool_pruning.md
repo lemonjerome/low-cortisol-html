@@ -165,10 +165,10 @@ This now aligns with your requirement that tool determination is model-guided, w
 4. Model preload behavior verification:
 - Confirmed no redundant pull when embedding model exists as `nomic-embed-text:latest` and runtime requests `nomic-embed-text`.
 
-## Embedding model sizing guidance (for compiler-focused tool pruning)
+## Embedding model sizing guidance (for HTML workflow tool pruning)
 
 Answer:
-- Lightweight embeddings remain sufficient for your current compiler-agent scope.
+- Lightweight embeddings remain sufficient for your current HTML-agent scope.
 
 Why:
 1. Tool catalog size is still small/moderate.

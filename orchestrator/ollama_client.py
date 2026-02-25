@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import urllib.error
 import urllib.request
 from typing import Any
@@ -104,9 +105,19 @@ class OllamaClient:
         model: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
+        stream: bool = False,
+        stream_label: str | None = None,
     ) -> dict[str, Any]:
         if self._mock_enabled:
             return self._mock_chat()
+
+        if stream:
+            return self._chat_stream(
+                model=model,
+                messages=messages,
+                tools=tools,
+                stream_label=stream_label,
+            )
 
         payload = {
             "model": model,
@@ -130,6 +141,82 @@ class OllamaClient:
             raise RuntimeError(f"Ollama HTTP error {error.code}: {detail}") from error
         except Exception as error:  # noqa: BLE001
             raise RuntimeError(f"Ollama request failed: {error}") from error
+
+    def _chat_stream(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        stream_label: str | None,
+    ) -> dict[str, Any]:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "stream": True,
+        }
+        request = urllib.request.Request(
+            f"{self.base_url}/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        assembled_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [],
+        }
+        final_chunk: dict[str, Any] = {}
+
+        try:
+            with urllib.request.urlopen(request, timeout=600) as response:
+                while True:
+                    line = response.readline()
+                    if not line:
+                        break
+                    decoded = line.decode("utf-8").strip()
+                    if not decoded:
+                        continue
+                    try:
+                        chunk = json.loads(decoded)
+                    except json.JSONDecodeError:
+                        continue
+
+                    final_chunk = chunk
+                    message = chunk.get("message")
+                    if not isinstance(message, dict):
+                        if chunk.get("done") is True:
+                            break
+                        continue
+
+                    piece = message.get("content", "")
+                    if isinstance(piece, str) and piece:
+                        assembled_message["content"] = f"{assembled_message.get('content', '')}{piece}"
+                        if stream_label:
+                            print(f"[stream:{stream_label}] {piece}", file=sys.stderr, end="", flush=True)
+
+                    tool_calls = message.get("tool_calls")
+                    if isinstance(tool_calls, list) and tool_calls:
+                        assembled_message["tool_calls"] = tool_calls
+
+                    if chunk.get("done") is True:
+                        break
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8") if error.fp else ""
+            raise RuntimeError(f"Ollama HTTP error {error.code}: {detail}") from error
+        except Exception as error:  # noqa: BLE001
+            raise RuntimeError(f"Ollama request failed: {error}") from error
+
+        if stream_label:
+            print("", file=sys.stderr, flush=True)
+
+        return {
+            "model": model,
+            "done": bool(final_chunk.get("done", True)),
+            "message": assembled_message,
+        }
 
     def embed(self, *, embedding_model: str, text: str) -> list[float]:
         if self._mock_enabled:
@@ -206,33 +293,111 @@ class OllamaClient:
 
         content = message.get("content", "")
         if isinstance(content, str):
-            fallback = self._parse_tool_call_from_content(content)
-            if fallback is not None:
-                return [fallback]
+            fallback = self._parse_tool_calls_from_content(content)
+            if fallback:
+                return fallback
         return parsed
 
-    def _parse_tool_call_from_content(self, content: str) -> dict[str, Any] | None:
-        start = content.find("{")
-        end = content.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            return None
+    def _parse_tool_calls_from_content(self, content: str) -> list[dict[str, Any]]:
+        candidates: list[str] = []
+        raw = content.strip()
+        if raw:
+            candidates.append(raw)
 
-        snippet = content[start : end + 1]
+        for block in self._extract_json_code_blocks(raw):
+            candidates.append(block)
+
+        start_obj = raw.find("{")
+        end_obj = raw.rfind("}")
+        if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
+            candidates.append(raw[start_obj : end_obj + 1])
+
+        start_arr = raw.find("[")
+        end_arr = raw.rfind("]")
+        if start_arr != -1 and end_arr != -1 and end_arr > start_arr:
+            candidates.append(raw[start_arr : end_arr + 1])
+
+        for snippet in candidates:
+            parsed = self._parse_tool_calls_json(snippet)
+            if parsed:
+                return parsed
+
+        return []
+
+    def _extract_json_code_blocks(self, content: str) -> list[str]:
+        blocks: list[str] = []
+        marker = "```"
+        cursor = 0
+        while True:
+            start = content.find(marker, cursor)
+            if start == -1:
+                break
+            end = content.find(marker, start + len(marker))
+            if end == -1:
+                break
+            block = content[start + len(marker) : end].strip()
+            if block.lower().startswith("json"):
+                block = block[4:].strip()
+            if block:
+                blocks.append(block)
+            cursor = end + len(marker)
+        return blocks
+
+    def _parse_tool_calls_json(self, snippet: str) -> list[dict[str, Any]]:
         try:
             payload = json.loads(snippet)
         except json.JSONDecodeError:
-            return None
+            return []
+
+        return self._normalize_tool_call_payload(payload)
+
+    def _normalize_tool_call_payload(self, payload: Any) -> list[dict[str, Any]]:
+        if isinstance(payload, list):
+            calls: list[dict[str, Any]] = []
+            for item in payload:
+                calls.extend(self._normalize_tool_call_payload(item))
+            return calls
 
         if not isinstance(payload, dict):
-            return None
+            return []
 
-        name = payload.get("name")
-        arguments = payload.get("arguments", {})
-        if not isinstance(name, str) or not name:
-            return None
-        if not isinstance(arguments, dict):
-            arguments = {}
-        return {"name": name, "arguments": arguments}
+        nested = payload.get("tool_call") or payload.get("tool")
+        if isinstance(nested, dict):
+            normalized_nested = self._normalize_tool_call_payload(nested)
+            if normalized_nested:
+                return normalized_nested
+
+        if "tool_calls" in payload and isinstance(payload["tool_calls"], list):
+            return self._normalize_tool_call_payload(payload["tool_calls"])
+
+        name = payload.get("name") or payload.get("tool_name")
+        arguments = payload.get("arguments", payload.get("args", {}))
+
+        if isinstance(name, str) and name:
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    arguments = {}
+            if not isinstance(arguments, dict):
+                arguments = {}
+            return [{"name": name, "arguments": arguments}]
+
+        function = payload.get("function")
+        if isinstance(function, dict):
+            fn_name = function.get("name")
+            fn_args = function.get("arguments", {})
+            if isinstance(fn_name, str) and fn_name:
+                if isinstance(fn_args, str):
+                    try:
+                        fn_args = json.loads(fn_args)
+                    except json.JSONDecodeError:
+                        fn_args = {}
+                if not isinstance(fn_args, dict):
+                    fn_args = {}
+                return [{"name": fn_name, "arguments": fn_args}]
+
+        return []
 
     def _pull_model(self, model: str) -> None:
         payload = {

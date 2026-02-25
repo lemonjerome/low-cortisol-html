@@ -6,15 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    gcc \
-    clang \
-    make \
-    flex \
-    bison \
-    gdb \
     git \
     curl \
+    nodejs \
+    npm \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

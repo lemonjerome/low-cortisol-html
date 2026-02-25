@@ -1,9 +1,9 @@
 services:
-  compilot:
+  low-cortisol-html:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    container_name: compilot-agent
+    container_name: low-cortisol-html-agent
     working_dir: /app
     volumes:
       - ..:/app

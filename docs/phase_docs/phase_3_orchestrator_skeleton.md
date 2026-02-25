@@ -31,7 +31,7 @@ Key behaviors:
   - `--workspace-root` (absolute workspace path)
   - `--task` (user prompt)
   - `--model` (default: `qwen2.5-coder:14b`)
-  - `--max-loops` (default: `5`)
+  - `--max-loops` (default: `10`)
 - Defines and sends a static tool schema list (`STATIC_TOOLS`) to the model.
 - Initializes:
   - Ollama client
@@ -112,7 +112,7 @@ This creates the foundational LLM↔Tool orchestration path required before tool
 ### A) Deterministic structured tool-call test (mock mode)
 
 Command used:
-- `ORCHESTRATOR_MOCK_TOOLCALL=1 python3 orchestrator/main_orchestrator.py --workspace-root /Users/gabrielramos/Desktop/compilot --task "Inspect docs directory and finish when done" --max-loops 4`
+- `ORCHESTRATOR_MOCK_TOOLCALL=1 python3 orchestrator/main_orchestrator.py --workspace-root "$PWD" --task "Inspect docs directory and finish when done" --max-loops 4`
 
 Observed:
 - Orchestrator performed tool call to `dummy_sandbox_echo`.
@@ -128,7 +128,7 @@ Observed:
 ### C) Real-model structured tool-call loop
 
 Command used:
-- `python3 orchestrator/main_orchestrator.py --workspace-root /Users/gabrielramos/Desktop/compilot --task "Use the dummy_sandbox_echo tool on relative path docs, then say DONE." --model qwen2.5-coder:14b --max-loops 4`
+- `python3 orchestrator/main_orchestrator.py --workspace-root "$PWD" --task "Use the dummy_sandbox_echo tool on relative path docs, then say DONE." --model qwen2.5-coder:14b --max-loops 4`
 
 Observed:
 - Tool call executed successfully.

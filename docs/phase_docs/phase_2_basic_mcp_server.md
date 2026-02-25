@@ -139,7 +139,7 @@ Implemented now:
 Planned later (deeper guardrails and logging):
 - Expanded input validation for all future tools.
 - Full action logging/tracing.
-- Additional policy enforcement across compiler/runtime tools.
+- Additional policy enforcement across web/runtime tools.
 
 ## Open-source and cost compliance
 

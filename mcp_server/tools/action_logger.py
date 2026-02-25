@@ -7,7 +7,7 @@ from typing import Any
 
 
 def log_tool_action(*, workspace_root: Path, tool_name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
-    logs_dir = workspace_root / ".compilot_logs"
+    logs_dir = workspace_root / ".low-cortisol-html-logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_file = logs_dir / "tool_actions.log"
 

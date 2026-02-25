@@ -8,13 +8,9 @@ __pycache__/
 .mypy_cache/
 
 # Runtime artifacts
-.compilot_logs/
+.low-cortisol-html-logs/
 logs/*.log
 embeddings/tool_vectors.json
-
-# Temporary validation sandbox
-phase5_samples/
-phase6_samples/
 
 # Native/build outputs
 build/

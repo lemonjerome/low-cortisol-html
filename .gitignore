@@ -14,6 +14,7 @@ embeddings/tool_vectors.json
 
 # Temporary validation sandbox
 phase5_samples/
+phase6_samples/
 
 # Native/build outputs
 build/

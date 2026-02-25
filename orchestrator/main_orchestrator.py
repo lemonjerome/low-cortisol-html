@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from device_detection import detect_compute_backend
 from loop_controller import LoopController
 from ollama_client import OllamaClient
 from planner import Planner
@@ -16,7 +17,7 @@ from tool_pruner import ToolPruner
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Phase 4 orchestrator with embedding-based tool pruning")
+    parser = argparse.ArgumentParser(description="Phase 6 orchestrator with reason-create-debug loop")
     parser.add_argument("--workspace-root", required=True, help="Absolute workspace path")
     parser.add_argument("--task", required=True, help="User task prompt")
     parser.add_argument("--model", default="qwen2.5-coder:14b", help="Ollama model name")
@@ -32,6 +33,12 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="Top-N embedding candidates before model reranking",
     )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "mps", "cuda", "cpu"],
+        help="Compute backend selection policy",
+    )
     parser.add_argument("--max-loops", type=int, default=5, help="Maximum orchestrator iterations")
     return parser.parse_args()
 
@@ -43,6 +50,8 @@ def main() -> int:
     ollama_base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
     vectors_path = project_root / "embeddings" / "tool_vectors.json"
     pruning_log_path = project_root / "logs" / "tool_pruning.log"
+    device_info = detect_compute_backend(args.device)
+    os.environ["COMPILOT_DEVICE"] = device_info["device"]
 
     client = OllamaClient(base_url=ollama_base_url)
     preload = client.ensure_models_loaded([args.model, args.embedding_model])
@@ -79,7 +88,7 @@ def main() -> int:
         json.dumps(
             {
                 "ok": True,
-                "phase": "phase_4_embedded_tool_pruning",
+                "phase": "phase_6_reason_create_debug_loop",
                 "ollama_base_url": ollama_base_url,
                 "ollama_health": health,
                 "model_preload": preload,
@@ -94,6 +103,7 @@ def main() -> int:
                     "vectors_path": str(vectors_path),
                     "log_path": str(pruning_log_path),
                 },
+                "compute_backend": device_info,
                 "orchestrator_result": result,
             }
         )

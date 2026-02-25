@@ -6,13 +6,218 @@ import sys
 from typing import Any
 
 from tool_registry import ToolDefinition, ToolRegistry
+from tools.action_logger import log_tool_action
+from tools.compiler_tools import clean_build_tool, compile_c_tool, run_binary_tool
 from tools.dummy_tools import sandbox_echo_path
+from tools.file_tools import create_file_tool, list_directory_tool, read_file_tool
+from tools.flex_bison_tools import generate_lexer_tool, generate_parser_tool, link_compiler_tool
 from tools.sandbox import resolve_workspace_root
 
 
 def _build_registry(workspace_root: str) -> ToolRegistry:
     resolved_workspace = resolve_workspace_root(workspace_root)
     registry = ToolRegistry()
+
+    def with_logging(tool_name: str, handler: Any) -> Any:
+        def wrapped(arguments: dict[str, Any]) -> dict[str, Any]:
+            try:
+                result = handler(arguments)
+                log_tool_action(
+                    workspace_root=resolved_workspace,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    result=result,
+                )
+                return result
+            except Exception as error:  # noqa: BLE001
+                log_tool_action(
+                    workspace_root=resolved_workspace,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    result={
+                        "ok": False,
+                        "error": {
+                            "type": error.__class__.__name__,
+                            "message": str(error),
+                        },
+                    },
+                )
+                raise
+
+        return wrapped
+
+    registry.register(
+        ToolDefinition(
+            name="create_file",
+            description="Create or overwrite a text file inside WORKSPACE_ROOT.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "relative_path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "overwrite": {"type": "boolean"},
+                },
+                "required": ["relative_path", "content"],
+                "additionalProperties": False,
+            },
+            handler=with_logging("create_file", lambda arguments: create_file_tool(arguments, resolved_workspace)),
+        )
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="read_file",
+            description="Read a text file from WORKSPACE_ROOT with size limits.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "relative_path": {"type": "string"},
+                    "max_bytes": {"type": "integer"},
+                },
+                "required": ["relative_path"],
+                "additionalProperties": False,
+            },
+            handler=with_logging("read_file", lambda arguments: read_file_tool(arguments, resolved_workspace)),
+        )
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="list_directory",
+            description="List files/directories in a workspace-relative directory.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "relative_path": {"type": "string"},
+                    "include_hidden": {"type": "boolean"},
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            handler=with_logging(
+                "list_directory",
+                lambda arguments: list_directory_tool(arguments, resolved_workspace),
+            ),
+        )
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="compile_c",
+            description="Compile C sources within workspace using guarded compiler flags and timeout.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "source_files": {"type": "array", "items": {"type": "string"}},
+                    "output_binary": {"type": "string"},
+                    "cflags": {"type": "array", "items": {"type": "string"}},
+                    "timeout_seconds": {"type": "integer"},
+                },
+                "required": ["source_files"],
+                "additionalProperties": False,
+            },
+            handler=with_logging("compile_c", lambda arguments: compile_c_tool(arguments, resolved_workspace)),
+        )
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="run_binary",
+            description="Execute a workspace binary with argument/timeout constraints.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "binary_path": {"type": "string"},
+                    "args": {"type": "array", "items": {"type": "string"}},
+                    "timeout_seconds": {"type": "integer"},
+                },
+                "required": ["binary_path"],
+                "additionalProperties": False,
+            },
+            handler=with_logging("run_binary", lambda arguments: run_binary_tool(arguments, resolved_workspace)),
+        )
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="clean_build",
+            description="Remove build files/directories in workspace only.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "targets": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            handler=with_logging("clean_build", lambda arguments: clean_build_tool(arguments, resolved_workspace)),
+        )
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="generate_lexer",
+            description="Generate C lexer output from a flex file inside workspace.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "lex_file": {"type": "string"},
+                    "output_c": {"type": "string"},
+                    "timeout_seconds": {"type": "integer"},
+                },
+                "required": ["lex_file"],
+                "additionalProperties": False,
+            },
+            handler=with_logging(
+                "generate_lexer",
+                lambda arguments: generate_lexer_tool(arguments, resolved_workspace),
+            ),
+        )
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="generate_parser",
+            description="Generate parser C/header outputs from a bison grammar inside workspace.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "grammar_file": {"type": "string"},
+                    "output_c": {"type": "string"},
+                    "output_h": {"type": "string"},
+                    "timeout_seconds": {"type": "integer"},
+                },
+                "required": ["grammar_file"],
+                "additionalProperties": False,
+            },
+            handler=with_logging(
+                "generate_parser",
+                lambda arguments: generate_parser_tool(arguments, resolved_workspace),
+            ),
+        )
+    )
+
+    registry.register(
+        ToolDefinition(
+            name="link_compiler",
+            description="Link C sources into a compiler binary inside workspace.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "source_files": {"type": "array", "items": {"type": "string"}},
+                    "output_binary": {"type": "string"},
+                    "extra_flags": {"type": "array", "items": {"type": "string"}},
+                    "timeout_seconds": {"type": "integer"},
+                },
+                "required": ["source_files"],
+                "additionalProperties": False,
+            },
+            handler=with_logging(
+                "link_compiler",
+                lambda arguments: link_compiler_tool(arguments, resolved_workspace),
+            ),
+        )
+    )
 
     registry.register(
         ToolDefinition(
@@ -29,7 +234,10 @@ def _build_registry(workspace_root: str) -> ToolRegistry:
                 "required": [],
                 "additionalProperties": False,
             },
-            handler=lambda arguments: sandbox_echo_path(arguments, resolved_workspace),
+            handler=with_logging(
+                "dummy_sandbox_echo",
+                lambda arguments: sandbox_echo_path(arguments, resolved_workspace),
+            ),
         )
     )
     return registry

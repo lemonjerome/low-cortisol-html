@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -11,28 +13,6 @@ from ollama_client import OllamaClient
 from planner import Planner
 from reranker import ToolReranker
 from tool_pruner import ToolPruner
-
-
-STATIC_TOOLS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "dummy_sandbox_echo",
-            "description": "Returns metadata for a workspace-relative path while enforcing sandbox boundaries.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "relative_path": {
-                        "type": "string",
-                        "description": "Path relative to WORKSPACE_ROOT",
-                    }
-                },
-                "required": [],
-                "additionalProperties": False,
-            },
-        },
-    }
-]
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,13 +56,14 @@ def main() -> int:
     )
     planner = Planner(ollama_client=client, model_name=args.model)
     reranker = ToolReranker(ollama_client=client, model_name=args.model)
+    tool_catalog = load_tools_from_mcp(project_root=project_root, workspace_root=workspace_root)
 
     controller = LoopController(
         project_root=project_root,
         workspace_root=workspace_root,
         ollama_client=client,
         model_name=args.model,
-        tools=STATIC_TOOLS,
+        tools=tool_catalog,
         planner=planner,
         reranker=reranker,
         tool_pruner=pruner,
@@ -118,6 +99,56 @@ def main() -> int:
         )
     )
     return 0
+
+
+def load_tools_from_mcp(*, project_root: Path, workspace_root: str) -> list[dict[str, Any]]:
+    env = os.environ.copy()
+    env["WORKSPACE_ROOT"] = workspace_root
+
+    request = {"action": "list_tools"}
+    result = subprocess.run(
+        [sys.executable, "mcp_server/server.py"],
+        cwd=str(project_root),
+        input=json.dumps(request),
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    output = result.stdout.strip() or result.stderr.strip()
+    payload = json.loads(output)
+    if not payload.get("ok"):
+        raise RuntimeError(f"Unable to load tools from MCP server: {payload}")
+
+    listed = payload.get("result", [])
+    if not isinstance(listed, list):
+        raise RuntimeError("Invalid list_tools payload")
+
+    catalog: list[dict[str, Any]] = []
+    for item in listed:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        description = item.get("description", "")
+        input_schema = item.get("input_schema", {})
+        if not isinstance(name, str) or not name:
+            continue
+        if not isinstance(input_schema, dict):
+            input_schema = {}
+
+        catalog.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": str(description),
+                    "parameters": input_schema,
+                },
+            }
+        )
+
+    return catalog
 
 
 if __name__ == "__main__":

@@ -1,0 +1,23 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local analysis/test caches
+.pytest_cache/
+.mypy_cache/
+
+# Runtime artifacts
+.compilot_logs/
+logs/*.log
+embeddings/tool_vectors.json
+
+# Temporary validation sandbox
+phase5_samples/
+
+# Native/build outputs
+build/
+*.o
+*.out
+*.so
+*.dylib

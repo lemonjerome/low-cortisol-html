@@ -119,7 +119,7 @@ New CLI options:
 - `--candidate-pool-size`
 
 Startup sequence:
-1. Ensure required models exist (`qwen2.5-coder:14b` + embedding model).
+1. Ensure required models exist (`qwen3:14b` + embedding model).
 2. Warm both models at startup (no lazy-load behavior).
 3. Instantiate planner, pruner, reranker.
 4. Run loop with dynamic per-iteration tool menu.

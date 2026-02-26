@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 from ollama_client import OllamaClient
@@ -18,6 +19,30 @@ class Planner:
         iteration: int,
         recent_messages: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        if os.environ.get("ORCHESTRATOR_FAST_MODE", "0") == "1":
+            phases = [
+                "Plan architecture and milestones",
+                "Implement HTML structure and layout",
+                "Implement CSS styling and spacing",
+                "Implement JavaScript state + CRUD flows",
+                "Refine UX interactions and edge cases",
+                "Run validation + tests and finalize",
+            ]
+            phase_index = min(max(iteration - 1, 0), len(phases) - 1)
+            return {
+                "subgoal": phases[phase_index],
+                "retrieval_query": self._normalize_retrieval_query(task, fallback=task),
+                "tool_hints": [],
+                "rationale": "Fast mode: using deterministic phase plan",
+                "app_purpose": "",
+                "suggested_features": [],
+                "visual_direction": "",
+                "interaction_model": "",
+                "unit_test_plan": [],
+                "development_phases": phases,
+                "active_phase": phases[phase_index],
+            }
+
         prompt = self._build_prompt(task=task, iteration=iteration, recent_messages=recent_messages)
         response = self.ollama_client.chat(
             model=self.model_name,

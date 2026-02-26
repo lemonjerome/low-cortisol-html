@@ -36,7 +36,7 @@ class OllamaClient:
 
     def list_model_names(self) -> list[str]:
         if self._mock_enabled:
-            return ["qwen2.5-coder:14b", "nomic-embed-text"]
+            return ["qwen3:14b", "nomic-embed-text"]
 
         health = self.health()
         if not health.get("ok"):
@@ -107,6 +107,8 @@ class OllamaClient:
         tools: list[dict[str, Any]],
         stream: bool = False,
         stream_label: str | None = None,
+        num_ctx: int | None = None,
+        num_predict: int | None = None,
     ) -> dict[str, Any]:
         if self._mock_enabled:
             return self._mock_chat()
@@ -117,6 +119,8 @@ class OllamaClient:
                 messages=messages,
                 tools=tools,
                 stream_label=stream_label,
+                num_ctx=num_ctx,
+                num_predict=num_predict,
             )
 
         payload = {
@@ -125,6 +129,13 @@ class OllamaClient:
             "tools": tools,
             "stream": False,
         }
+        options: dict[str, Any] = {}
+        if isinstance(num_ctx, int) and num_ctx > 0:
+            options["num_ctx"] = num_ctx
+        if isinstance(num_predict, int) and num_predict > 0:
+            options["num_predict"] = num_predict
+        if options:
+            payload["options"] = options
         request = urllib.request.Request(
             f"{self.base_url}/api/chat",
             data=json.dumps(payload).encode("utf-8"),
@@ -133,7 +144,7 @@ class OllamaClient:
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
+            with urllib.request.urlopen(request, timeout=600) as response:
                 body = response.read().decode("utf-8")
                 return json.loads(body)
         except urllib.error.HTTPError as error:
@@ -149,6 +160,8 @@ class OllamaClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         stream_label: str | None,
+        num_ctx: int | None = None,
+        num_predict: int | None = None,
     ) -> dict[str, Any]:
         payload = {
             "model": model,
@@ -156,6 +169,13 @@ class OllamaClient:
             "tools": tools,
             "stream": True,
         }
+        options: dict[str, Any] = {}
+        if isinstance(num_ctx, int) and num_ctx > 0:
+            options["num_ctx"] = num_ctx
+        if isinstance(num_predict, int) and num_predict > 0:
+            options["num_predict"] = num_predict
+        if options:
+            payload["options"] = options
         request = urllib.request.Request(
             f"{self.base_url}/api/chat",
             data=json.dumps(payload).encode("utf-8"),
@@ -169,6 +189,33 @@ class OllamaClient:
             "tool_calls": [],
         }
         final_chunk: dict[str, Any] = {}
+        stream_buffer = ""
+
+        def flush_stream_buffer(force: bool = False) -> None:
+            nonlocal stream_buffer
+            if not stream_label:
+                return
+            candidate = stream_buffer
+            if not candidate:
+                return
+
+            if not force and "\n" not in candidate and len(candidate) < 140:
+                return
+
+            if "\n" in candidate:
+                parts = candidate.split("\n")
+                lines_to_emit = parts[:-1]
+                stream_buffer = parts[-1]
+                for line in lines_to_emit:
+                    text = line.strip()
+                    if text:
+                        print(f"[stream:{stream_label}] {text}", file=sys.stderr, flush=True)
+                return
+
+            text = candidate.strip()
+            if text:
+                print(f"[stream:{stream_label}] {text}", file=sys.stderr, flush=True)
+            stream_buffer = ""
 
         try:
             with urllib.request.urlopen(request, timeout=600) as response:
@@ -194,8 +241,8 @@ class OllamaClient:
                     piece = message.get("content", "")
                     if isinstance(piece, str) and piece:
                         assembled_message["content"] = f"{assembled_message.get('content', '')}{piece}"
-                        if stream_label:
-                            print(f"[stream:{stream_label}] {piece}", file=sys.stderr, end="", flush=True)
+                        stream_buffer = f"{stream_buffer}{piece}"
+                        flush_stream_buffer(force=False)
 
                     tool_calls = message.get("tool_calls")
                     if isinstance(tool_calls, list) and tool_calls:
@@ -209,8 +256,7 @@ class OllamaClient:
         except Exception as error:  # noqa: BLE001
             raise RuntimeError(f"Ollama request failed: {error}") from error
 
-        if stream_label:
-            print("", file=sys.stderr, flush=True)
+        flush_stream_buffer(force=True)
 
         return {
             "model": model,
@@ -299,30 +345,44 @@ class OllamaClient:
         return parsed
 
     def _parse_tool_calls_from_content(self, content: str) -> list[dict[str, Any]]:
-        candidates: list[str] = []
+        payloads: list[Any] = []
         raw = content.strip()
         if raw:
-            candidates.append(raw)
+            payloads.extend(self._extract_json_payloads(raw))
 
         for block in self._extract_json_code_blocks(raw):
-            candidates.append(block)
+            payloads.extend(self._extract_json_payloads(block))
 
-        start_obj = raw.find("{")
-        end_obj = raw.rfind("}")
-        if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
-            candidates.append(raw[start_obj : end_obj + 1])
+        calls: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for payload in payloads:
+            parsed = self._normalize_tool_call_payload(payload)
+            for call in parsed:
+                key = json.dumps(call, sort_keys=True)
+                if key in seen:
+                    continue
+                seen.add(key)
+                calls.append(call)
 
-        start_arr = raw.find("[")
-        end_arr = raw.rfind("]")
-        if start_arr != -1 and end_arr != -1 and end_arr > start_arr:
-            candidates.append(raw[start_arr : end_arr + 1])
+        return calls
 
-        for snippet in candidates:
-            parsed = self._parse_tool_calls_json(snippet)
-            if parsed:
-                return parsed
-
-        return []
+    def _extract_json_payloads(self, text: str) -> list[Any]:
+        decoder = json.JSONDecoder()
+        payloads: list[Any] = []
+        index = 0
+        length = len(text)
+        while index < length:
+            while index < length and text[index].isspace():
+                index += 1
+            if index >= length:
+                break
+            try:
+                payload, end_index = decoder.raw_decode(text, index)
+            except json.JSONDecodeError:
+                break
+            payloads.append(payload)
+            index = end_index
+        return payloads
 
     def _extract_json_code_blocks(self, content: str) -> list[str]:
         blocks: list[str] = []

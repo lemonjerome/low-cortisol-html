@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -129,6 +130,14 @@ def run_unit_tests_tool(arguments: dict[str, Any], workspace_root: Path) -> dict
     test_path = resolve_path_in_workspace(workspace_root, test_file)
     if not test_path.exists() or not test_path.is_file():
         raise ValueError("test_file does not exist")
+
+    file_name = test_path.name.lower()
+    if not re.search(r"(test|spec)s?\.js$", file_name):
+        raise ValueError("test_file must be a real JS test file (e.g., tests.js or *.test.js)")
+
+    source = test_path.read_text(encoding="utf-8", errors="replace")
+    if "assert(" not in source and "test(" not in source:
+        raise ValueError("test_file must contain test assertions")
 
     node_binary = shutil.which("node")
     if node_binary is None:

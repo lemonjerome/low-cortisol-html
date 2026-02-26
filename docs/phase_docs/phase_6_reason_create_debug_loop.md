@@ -41,12 +41,7 @@ This enables validation that multi-step failures were observed and followed by r
 ### 4) Completion gating
 Completion now requires explicit success signal:
 - `DONE:` prefix in assistant message,
-- otherwise loop continues until `max_loops`.
-
-When loop limit is reached:
-- system prompts user whether to continue,
-- `yes` extends budget by `+5` loops,
-- `no` stops and returns `max_loops_reached`.
+- otherwise loop continues.
 
 This prevents premature stop when the model returns plain text without truly finishing the task.
 

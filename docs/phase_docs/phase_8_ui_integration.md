@@ -25,7 +25,7 @@ Provide a local UI for project management and chat-driven HTML workflow executio
 - Modal asks:
   - parent directory (default workspace root)
   - workspace folder name (default `lch_new_project`)
-- Supports `Choose` button (Finder on macOS host) with graceful fallback error handling.
+- Supports `Choose` button with cross-platform chooser fallback handling.
 - Creates workspace directory after validation.
 - Clears chat/memory when project is created.
 
@@ -59,8 +59,7 @@ Implemented in `ui/server.py`:
 ## Docker launch integration
 `docker/docker-compose.yml` now supports one-command launch for the UI runtime with:
 - source mount (`..:/app`)
-- workspace mount (`${HOME}/Desktop/lch_workspaces:/workspaces`)
-- `DEFAULT_WORKSPACES_ROOT=/workspaces`
+- workspace mount (`${HOME}/Desktop/lch_workspaces:/root/Desktop/lch_workspaces`)
 - `8000:8000` port mapping
 
 Run:

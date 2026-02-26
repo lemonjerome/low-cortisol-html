@@ -4,12 +4,12 @@
 
 This phase implemented the first working orchestrator skeleton that can:
 
-1. Connect to Ollama (`qwen2.5-coder:14b`) via local HTTP API.
+1. Connect to Ollama (`qwen3:14b`) via local HTTP API.
 2. Send a static tool list to the model.
 3. Receive and interpret structured tool calls.
 4. Route tool executions to the MCP server.
 5. Feed tool output back into the conversation loop.
-6. Stop when the model indicates completion (`DONE`) or when loop limit is reached.
+6. Stop when the model indicates completion (`DONE`).
 
 ## New files created
 
@@ -30,8 +30,7 @@ Key behaviors:
 - Accepts:
   - `--workspace-root` (absolute workspace path)
   - `--task` (user prompt)
-  - `--model` (default: `qwen2.5-coder:14b`)
-  - `--max-loops` (default: `10`)
+  - `--model` (default: `qwen3:14b`)
 - Defines and sends a static tool schema list (`STATIC_TOOLS`) to the model.
 - Initializes:
   - Ollama client
@@ -59,8 +58,7 @@ Core flow:
    - Capture and parse structured JSON result.
    - Append tool result message back into conversation.
 5. Repeat until:
-   - model produces no tool call (completion), or
-   - max loops reached.
+  - model produces no tool call (completion).
 
 Outputs:
 - `status`, `iterations`, `final_message`, and `tool_trace`.
@@ -103,7 +101,7 @@ Phase 3 integration flow:
 4. Orchestrator calls MCP server through stdin JSON request.
 5. MCP server executes tool in workspace sandbox and returns JSON.
 6. Orchestrator appends tool result and continues loop.
-7. Loop ends on completion condition and returns structured summary.
+7. Loop ends when the model returns `DONE` and returns structured summary.
 
 This creates the foundational LLM↔Tool orchestration path required before tool-pruning logic in Phase 4.
 
@@ -112,7 +110,7 @@ This creates the foundational LLM↔Tool orchestration path required before tool
 ### A) Deterministic structured tool-call test (mock mode)
 
 Command used:
-- `ORCHESTRATOR_MOCK_TOOLCALL=1 python3 orchestrator/main_orchestrator.py --workspace-root "$PWD" --task "Inspect docs directory and finish when done" --max-loops 4`
+- `ORCHESTRATOR_MOCK_TOOLCALL=1 python3 orchestrator/main_orchestrator.py --workspace-root "$PWD" --task "Inspect docs directory and finish when done"`
 
 Observed:
 - Orchestrator performed tool call to `dummy_sandbox_echo`.
@@ -123,12 +121,12 @@ Observed:
 
 Observed:
 - `http://localhost:11434/api/tags` reachable.
-- Local models detected, including `qwen2.5-coder:14b`.
+- Local models detected, including `qwen3:14b`.
 
 ### C) Real-model structured tool-call loop
 
 Command used:
-- `python3 orchestrator/main_orchestrator.py --workspace-root "$PWD" --task "Use the dummy_sandbox_echo tool on relative path docs, then say DONE." --model qwen2.5-coder:14b --max-loops 4`
+- `python3 orchestrator/main_orchestrator.py --workspace-root "$PWD" --task "Use the dummy_sandbox_echo tool on relative path docs, then say DONE." --model qwen3:14b`
 
 Observed:
 - Tool call executed successfully.

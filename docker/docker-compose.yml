@@ -7,14 +7,12 @@ services:
     working_dir: /app
     volumes:
       - ..:/app
-      - ${HOME}/Desktop/lch_workspaces:/workspaces
+      - ${HOME}/Desktop/lch_workspaces:/root/Desktop/lch_workspaces
     environment:
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       WORKSPACE_ROOT: ""
-      DEFAULT_WORKSPACES_ROOT: /workspaces
       UI_HOST: 0.0.0.0
       UI_PORT: 8000
-      ORCHESTRATOR_LOOP_CONTINUE: "no"
     ports:
       - "8000:8000"
     extra_hosts:

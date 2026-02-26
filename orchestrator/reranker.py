@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 from ollama_client import OllamaClient
@@ -21,6 +22,17 @@ class ToolReranker:
     ) -> dict[str, Any]:
         if not candidates:
             return {"selected": [], "report": {"method": "empty", "selected": []}}
+
+        if os.environ.get("ORCHESTRATOR_FAST_MODE", "0") == "1":
+            heuristic_ranked = sorted(candidates, key=lambda item: item["score"], reverse=True)
+            selected = heuristic_ranked[: max(1, min(top_k, len(heuristic_ranked)))]
+            return {
+                "selected": selected,
+                "report": {
+                    "method": "fast_embedding_only",
+                    "selected": [{"name": item["name"], "score": item["score"]} for item in selected],
+                },
+            }
 
         model_scored = self._model_score(task=task, plan=plan, candidates=candidates)
         if model_scored:

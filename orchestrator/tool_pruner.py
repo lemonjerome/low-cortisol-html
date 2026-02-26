@@ -21,6 +21,8 @@ class ToolPruner:
         self.embedding_model = embedding_model
         self.vectors_path = vectors_path
         self.pruning_log_path = pruning_log_path
+        self.query_embedding_cache: dict[str, list[float]] = {}
+        self.max_query_cache_items = 32
 
     def retrieve_candidates(
         self,
@@ -30,7 +32,14 @@ class ToolPruner:
         top_n: int,
     ) -> dict[str, Any]:
         vectors = self._load_or_generate_vectors(tools)
-        query_vector = self.ollama_client.embed(embedding_model=self.embedding_model, text=query)
+        query_key = query.strip()
+        query_vector = self.query_embedding_cache.get(query_key)
+        if query_vector is None:
+            query_vector = self.ollama_client.embed(embedding_model=self.embedding_model, text=query_key)
+            if len(self.query_embedding_cache) >= self.max_query_cache_items:
+                oldest_key = next(iter(self.query_embedding_cache))
+                self.query_embedding_cache.pop(oldest_key, None)
+            self.query_embedding_cache[query_key] = query_vector
 
         scored: list[dict[str, Any]] = []
         for tool in tools:

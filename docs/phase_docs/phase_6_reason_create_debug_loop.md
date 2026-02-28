@@ -1,11 +1,9 @@
-# Phase 6 — Reason–Create–Debug Loop
+# Phase 6 — Two-Stage Pipeline Agent
 
 ## Objective
-Implement a robust iterative control loop that:
-1. reasons about next action,
-2. creates/edits/runs using tools,
-3. consumes tool/runtime diagnostics,
-4. repeats until objective completion is explicitly confirmed.
+Replace the general-purpose iterative loop with a focused two-stage pipeline optimized for HTML/CSS/JS generation:
+1. **Plan** — one thorough planning pass using `plan_web_build`.
+2. **Code** — write all required files in a single pass using `create_file`.
 
 Additionally, add automatic compute backend detection:
 - macOS => `mps`
@@ -14,36 +12,43 @@ Additionally, add automatic compute backend detection:
 
 ## Implemented Changes
 
-### 1) Iterative Reason→Create→Debug loop behavior
-Updated `orchestrator/loop_controller.py` to enforce loop discipline:
-- System prompt now explicitly frames operation as a `Reason→Create→Debug` loop.
-- Agent must end with a final response starting with `DONE:`.
-- If assistant returns no tool calls without `DONE:`, controller injects a continuation instruction and loops.
+### 1) Two-stage pipeline (`orchestrator/loop_controller.py`)
+The loop controller now runs exactly two sequential stages:
 
-### 2) Tool diagnostics feedback injection
-Added tool/runtime feedback extraction and reinjection in `orchestrator/loop_controller.py`:
-- Collects failures from tool calls in:
-  - `create_file`
-  - `read_file`
-  - `list_directory`
-  - `scaffold_web_app`
-  - `validate_web_app`
-  - `run_unit_tests`
-  - `plan_web_build`
-- Extracts `stderr`, `stdout`, and structured `error` payloads.
-- Injects summarized diagnostics as a new user message so the model repairs in next iteration.
-- Persists repair events in `repair_trace` for post-run inspection.
+```
+Stage 1 — plan
+  Allowed tools: plan_web_build, read_file, list_directory
+  Goal: produce a comprehensive feature-level plan
 
-### 3) Multi-step repair confirmation support
-The loop now records `repair_trace` containing per-iteration diagnostics and tools involved.
-This enables validation that multi-step failures were observed and followed by repair attempts before completion.
+Stage 2 — code
+  Allowed tools: create_file (only)
+  Goal: write every file (HTML, CSS, JS) in one pass
+```
 
-### 4) Completion gating
-Completion now requires explicit success signal:
-- `DONE:` prefix in assistant message,
-- otherwise loop continues.
+Each stage gets its own LLM call. Tool availability is restricted per stage — the model cannot call `create_file` during planning, and cannot call planning tools during coding.
 
-This prevents premature stop when the model returns plain text without truly finishing the task.
+### 2) Workspace detection
+Before any stage runs, the controller inspects the workspace:
+- **Empty workspace** → new project path; model is told to create everything from scratch.
+- **Populated workspace** → existing project path; model receives the current file list and contents (capped at first 30 files / 10 KB per file) as context before planning.
+
+### 3) Adaptive recovery within stages
+- If the model returns an empty response, the controller sends a nudge prompt and retries once.
+- If the model embeds tool calls as raw JSON text (instead of structured calls), the controller parses and extracts them.
+- Tool name aliases (`edit_file`, `write_file`, `open_file`, etc.) are normalized to canonical MCP tool names.
+- Duplicate tool calls within a stage are deduplicated to avoid redundant file writes.
+
+### 4) Validation pass (informational)
+After both stages complete, the controller runs `validate_web_app` as a read-only check and emits the result as reasoning output. Validation failures do not restart the pipeline.
+
+### 5) Session and project memory
+- `SessionMemory` holds the conversation messages for the current run.
+- `ProjectMemory` tracks which files were touched and provides file-level semantic retrieval context.
+- Both are reset at the start of each new run.
+
+### 6) Context management
+- Long conversation histories are compacted to stay within model context limits.
+- Code stage is given a higher `num_predict` budget (default 16 384 tokens) vs planning (8 192).
 
 ## Auto GPU Detection
 
@@ -63,15 +68,19 @@ Updated `orchestrator/main_orchestrator.py`:
 - Exports selected backend to `LOW_CORTISOL_HTML_DEVICE` environment variable.
 - Includes backend info in final JSON output under `compute_backend`.
 
-## Validation Expectations
-Manual checks should confirm:
-1. Loop does not terminate early unless assistant replies with `DONE:`.
-2. Tool failure output appears in next-iteration context (via feedback injection).
-3. `repair_trace` records failure cycles.
-4. Device auto-detection returns:
-   - macOS => `mps`
-   - NVIDIA Linux/WSL host with `nvidia-smi` => `cuda`
-   - otherwise => `cpu`
+## Result shape
+```json
+{
+  "ok": true,
+  "status": "completed",
+  "iterations": 2,
+  "final_message": "...",
+  "tool_trace": [...],
+  "selection_trace": [],
+  "repair_trace": []
+}
+```
+`iterations` is always 2 (one per stage). `selection_trace` and `repair_trace` are kept for schema compatibility but are empty in the current pipeline.
 
 ## Phase 6 Completion Status
 Implemented.

@@ -19,6 +19,7 @@ def scaffold_web_app_tool(arguments: dict[str, Any], workspace_root: Path) -> di
 
     index_html = target_dir / "index.html"
     styles_css = target_dir / "styles.css"
+    script_js = target_dir / "script.js"
     app_js = target_dir / "app.js"
     tests_js = target_dir / "tests.js"
 
@@ -34,7 +35,7 @@ def scaffold_web_app_tool(arguments: dict[str, Any], workspace_root: Path) -> di
   </head>
   <body>
     <main id=\"app\"></main>
-    <script src=\"app.js\"></script>
+        <script src="script.js"></script>
   </body>
 </html>
 """.format(title=app_title),
@@ -50,8 +51,8 @@ body { margin: 0; font-family: system-ui, sans-serif; padding: 24px; }
             encoding="utf-8",
         )
 
-    if not app_js.exists():
-        app_js.write_text(
+    if not script_js.exists() and not app_js.exists():
+        script_js.write_text(
             """const app = document.getElementById('app');
 if (app) {
   app.innerHTML = '<h1>Concept Ready</h1><p>Start building your HTML idea.</p>';
@@ -85,7 +86,7 @@ runTests();
         "created_or_verified": [
             str(index_html),
             str(styles_css),
-            str(app_js),
+            str(script_js if script_js.exists() else app_js),
             str(tests_js),
         ],
     }
@@ -99,18 +100,23 @@ def validate_web_app_tool(arguments: dict[str, Any], workspace_root: Path) -> di
     if not target_dir.exists() or not target_dir.is_dir():
         raise ValueError("app_dir does not exist")
 
-    required_files = ["index.html", "styles.css", "app.js"]
+    script_target = target_dir / "script.js"
+    app_target = target_dir / "app.js"
+    required_files = ["index.html", "styles.css"]
     missing: list[str] = []
     for file_name in required_files:
         path = target_dir / file_name
         if not path.exists() or not path.is_file():
             missing.append(file_name)
+    if not script_target.exists() and not app_target.exists():
+        missing.append("script.js")
 
     issues: list[str] = []
     if not missing:
         html = (target_dir / "index.html").read_text(encoding="utf-8", errors="replace")
-        if "<script src=\"app.js\"" not in html:
-            issues.append("index.html does not reference app.js")
+        script_ref_ok = "<script src=\"script.js\"" in html or "<script src=\"app.js\"" in html
+        if not script_ref_ok:
+            issues.append("index.html does not reference script.js or app.js")
         if "<link rel=\"stylesheet\" href=\"styles.css\"" not in html:
             issues.append("index.html does not reference styles.css")
 

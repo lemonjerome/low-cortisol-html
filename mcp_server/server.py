@@ -9,15 +9,12 @@ from tool_registry import ToolDefinition, ToolRegistry
 from tools.action_logger import log_tool_action
 from tools.dummy_tools import sandbox_echo_path
 from tools.file_tools import (
-    append_to_file_tool,
     create_file_tool,
-    insert_after_marker_tool,
     list_directory_tool,
     read_file_tool,
-    replace_range_tool,
 )
 from tools.sandbox import resolve_workspace_root
-from tools.web_tools import plan_web_build_tool, run_unit_tests_tool, scaffold_web_app_tool, validate_web_app_tool
+from tools.web_tools import plan_web_build_tool, run_unit_tests_tool, validate_web_app_tool
 
 
 def _build_registry(workspace_root: str) -> ToolRegistry:
@@ -72,68 +69,6 @@ def _build_registry(workspace_root: str) -> ToolRegistry:
 
     registry.register(
         ToolDefinition(
-            name="append_to_file",
-            description="Append content to an existing text file inside WORKSPACE_ROOT.",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "relative_path": {"type": "string"},
-                    "content": {"type": "string"},
-                    "ensure_newline": {"type": "boolean"},
-                },
-                "required": ["relative_path", "content"],
-                "additionalProperties": False,
-            },
-            handler=with_logging("append_to_file", lambda arguments: append_to_file_tool(arguments, resolved_workspace)),
-        )
-    )
-
-    registry.register(
-        ToolDefinition(
-            name="insert_after_marker",
-            description="Insert content immediately after a marker string in an existing file.",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "relative_path": {"type": "string"},
-                    "marker": {"type": "string"},
-                    "content": {"type": "string"},
-                    "occurrence": {"type": "string"},
-                },
-                "required": ["relative_path", "marker", "content"],
-                "additionalProperties": False,
-            },
-            handler=with_logging(
-                "insert_after_marker",
-                lambda arguments: insert_after_marker_tool(arguments, resolved_workspace),
-            ),
-        )
-    )
-
-    registry.register(
-        ToolDefinition(
-            name="replace_range",
-            description="Replace an inclusive line range in an existing file.",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "relative_path": {"type": "string"},
-                    "file_path": {"type": "string"},
-                    "start_line": {"type": "integer"},
-                    "end_line": {"type": "integer"},
-                    "content": {"type": "string"},
-                    "replacement_text": {"type": "string"},
-                    "allow_empty": {"type": "boolean"},
-                },
-                "required": ["start_line", "end_line"],
-                "additionalProperties": False,
-            },
-            handler=with_logging("replace_range", lambda arguments: replace_range_tool(arguments, resolved_workspace)),
-        )
-    )
-
-    registry.register(
-        ToolDefinition(
             name="read_file",
             description="Read a text file from WORKSPACE_ROOT with size limits.",
             input_schema={
@@ -165,26 +100,6 @@ def _build_registry(workspace_root: str) -> ToolRegistry:
             handler=with_logging(
                 "list_directory",
                 lambda arguments: list_directory_tool(arguments, resolved_workspace),
-            ),
-        )
-    )
-
-    registry.register(
-        ToolDefinition(
-            name="scaffold_web_app",
-            description="Create a minimal HTML/CSS/JS app scaffold for a concept prototype.",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "app_dir": {"type": "string"},
-                    "app_title": {"type": "string"},
-                },
-                "required": ["app_dir"],
-                "additionalProperties": False,
-            },
-            handler=with_logging(
-                "scaffold_web_app",
-                lambda arguments: scaffold_web_app_tool(arguments, resolved_workspace),
             ),
         )
     )

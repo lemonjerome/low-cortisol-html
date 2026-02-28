@@ -20,7 +20,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Low-cortisol-html orchestrator with phased reasoning and web concept build loop")
     parser.add_argument("--workspace-root", required=True, help="Absolute workspace path")
     parser.add_argument("--task", required=True, help="User task prompt")
-    parser.add_argument("--model", default="qwen3:14b", help="Ollama model name")
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("ORCHESTRATOR_MODEL", "qwen2.5-coder:14b"),
+        help="Ollama model name",
+    )
     parser.add_argument(
         "--embedding-model",
         default=os.environ.get("EMBEDDING_MODEL", "nomic-embed-text"),
@@ -54,34 +58,56 @@ def main() -> int:
     os.environ["EMBEDDING_MODEL"] = args.embedding_model
 
     client = OllamaClient(base_url=ollama_base_url)
-    preload = client.ensure_models_loaded([args.model, args.embedding_model])
-    warmup = client.warmup_models(chat_model=args.model, embedding_model=args.embedding_model)
+    fallback_model = os.environ.get("ORCHESTRATOR_FALLBACK_MODEL", "qwen3:7b")
 
-    pruner = ToolPruner(
-        ollama_client=client,
-        embedding_model=args.embedding_model,
-        vectors_path=vectors_path,
-        pruning_log_path=pruning_log_path,
-    )
-    planner = Planner(ollama_client=client, model_name=args.model)
-    reranker = ToolReranker(ollama_client=client, model_name=args.model)
-    tool_catalog = load_tools_from_mcp(project_root=project_root, workspace_root=workspace_root)
+    selected_model = args.model
+    fallback_used = False
+    fallback_reason = ""
 
-    controller = LoopController(
-        project_root=project_root,
-        workspace_root=workspace_root,
-        ollama_client=client,
-        model_name=args.model,
-        tools=tool_catalog,
-        planner=planner,
-        reranker=reranker,
-        tool_pruner=pruner,
-        top_k_tools=args.top_k_tools,
-        candidate_pool_size=args.candidate_pool_size,
-    )
+    try:
+        preload, warmup, result = _run_orchestrator_once(
+            client=client,
+            model_name=selected_model,
+            embedding_model=args.embedding_model,
+            project_root=project_root,
+            workspace_root=workspace_root,
+            vectors_path=vectors_path,
+            pruning_log_path=pruning_log_path,
+            top_k_tools=args.top_k_tools,
+            candidate_pool_size=args.candidate_pool_size,
+            task=args.task,
+        )
+    except RuntimeError as error:
+        error_text = str(error)
+        if (
+            _is_tool_call_unsupported_error(error_text)
+            and fallback_model
+            and fallback_model != selected_model
+        ):
+            fallback_used = True
+            fallback_reason = error_text
+            selected_model = fallback_model
+            print(
+                f"[status:agent] model fallback: {args.model} -> {fallback_model}",
+                file=sys.stderr,
+                flush=True,
+            )
+            preload, warmup, result = _run_orchestrator_once(
+                client=client,
+                model_name=selected_model,
+                embedding_model=args.embedding_model,
+                project_root=project_root,
+                workspace_root=workspace_root,
+                vectors_path=vectors_path,
+                pruning_log_path=pruning_log_path,
+                top_k_tools=args.top_k_tools,
+                candidate_pool_size=args.candidate_pool_size,
+                task=args.task,
+            )
+        else:
+            raise
 
     health = client.health()
-    result = controller.run(args.task)
 
     print(
         json.dumps(
@@ -90,10 +116,17 @@ def main() -> int:
                 "phase": "phase_7_low_cortisol_html_pivot",
                 "ollama_base_url": ollama_base_url,
                 "ollama_health": health,
+                "requested_model": args.model,
+                "active_model": selected_model,
+                "model_fallback": {
+                    "used": fallback_used,
+                    "fallback_model": fallback_model,
+                    "reason": fallback_reason,
+                },
                 "model_preload": preload,
                 "model_warmup": warmup,
-                "planner": {"enabled": True, "model": args.model},
-                "reranker": {"enabled": True, "model": args.model},
+                "planner": {"enabled": True, "model": selected_model},
+                "reranker": {"enabled": True, "model": selected_model},
                 "tool_pruning": {
                     "enabled": True,
                     "embedding_model": args.embedding_model,
@@ -108,6 +141,53 @@ def main() -> int:
         )
     )
     return 0
+
+
+def _run_orchestrator_once(
+    *,
+    client: OllamaClient,
+    model_name: str,
+    embedding_model: str,
+    project_root: Path,
+    workspace_root: str,
+    vectors_path: Path,
+    pruning_log_path: Path,
+    top_k_tools: int,
+    candidate_pool_size: int,
+    task: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    preload = client.ensure_models_loaded([model_name, embedding_model])
+    warmup = client.warmup_models(chat_model=model_name, embedding_model=embedding_model)
+
+    pruner = ToolPruner(
+        ollama_client=client,
+        embedding_model=embedding_model,
+        vectors_path=vectors_path,
+        pruning_log_path=pruning_log_path,
+    )
+    planner = Planner(ollama_client=client, model_name=model_name)
+    reranker = ToolReranker(ollama_client=client, model_name=model_name)
+    tool_catalog = load_tools_from_mcp(project_root=project_root, workspace_root=workspace_root)
+
+    controller = LoopController(
+        project_root=project_root,
+        workspace_root=workspace_root,
+        ollama_client=client,
+        model_name=model_name,
+        tools=tool_catalog,
+        planner=planner,
+        reranker=reranker,
+        tool_pruner=pruner,
+        top_k_tools=top_k_tools,
+        candidate_pool_size=candidate_pool_size,
+    )
+    result = controller.run(task)
+    return preload, warmup, result
+
+
+def _is_tool_call_unsupported_error(message: str) -> bool:
+    lowered = message.lower()
+    return "does not support tools" in lowered or "doesn't support tools" in lowered
 
 
 def _sanitize_orchestrator_result(result: dict[str, Any]) -> dict[str, Any]:

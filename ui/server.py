@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -21,8 +21,39 @@ UI_DIR = Path(__file__).resolve().parent
 WORKSPACE_PREFIX = "lch_"
 
 
+def _find_desktop() -> Path:
+    """Return the user's Desktop directory in a cross-platform / container-aware way."""
+    # Windows: try registry first, fall back to USERPROFILE\Desktop
+    if sys.platform == "win32":
+        try:
+            import winreg  # type: ignore[import]
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+            ) as key:
+                return Path(winreg.QueryValueEx(key, "Desktop")[0])
+        except Exception:
+            pass
+        return Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
+
+    # XDG (Linux/Wayland)
+    xdg = os.environ.get("XDG_DESKTOP_DIR", "").strip()
+    if xdg:
+        p = Path(xdg).expanduser().resolve()
+        if p.is_dir():
+            return p
+
+    # Docker / container: the docker-compose mounts host Desktop into /root/Desktop
+    # Standard fallback: ~/Desktop  (works on macOS, most Linux distros, and the container mount)
+    return Path.home() / "Desktop"
+
+
 def _default_workspaces_root() -> Path:
-    return (Path.home() / "Desktop" / "lch_workspaces").resolve()
+    """Return ~/Desktop/lch_workspaces, creating it if it doesn't exist."""
+    desktop = _find_desktop()
+    root = (desktop / "lch_workspaces").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def _is_container_runtime() -> bool:
@@ -82,7 +113,6 @@ class AppState:
 
 
 STATE = AppState()
-STATE.workspaces_root.mkdir(parents=True, exist_ok=True)
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -98,6 +128,79 @@ def ndjson_event(handler: BaseHTTPRequestHandler, payload: dict[str, Any]) -> No
     line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
     handler.wfile.write(line)
     handler.wfile.flush()
+
+
+def ndjson_reasoning_stream(handler: BaseHTTPRequestHandler, *, stage: str, text: str, stream_id: str) -> None:
+    cleaned = text if isinstance(text, str) else str(text)
+    if not cleaned.strip():
+        return
+    ndjson_event(
+        handler,
+        {
+            "type": "reasoning_stream",
+            "token": "start",
+            "stage": stage,
+            "stream_id": stream_id,
+        },
+    )
+    parts = re.findall(r"\S+\s*", cleaned)
+    for part in parts:
+        ndjson_event(
+            handler,
+            {
+                "type": "reasoning_stream",
+                "token": "word",
+                "stage": stage,
+                "stream_id": stream_id,
+                "text": part,
+            },
+        )
+    ndjson_event(
+        handler,
+        {
+            "type": "reasoning_stream",
+            "token": "end",
+            "stage": stage,
+            "stream_id": stream_id,
+        },
+    )
+
+
+def _parse_stream_chunk_text(raw_text: str) -> str:
+    payload = raw_text.strip()
+    if not payload:
+        return ""
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return payload
+    if isinstance(parsed, dict):
+        value = parsed.get("text", parsed.get("content", ""))
+        return str(value)
+    if isinstance(parsed, str):
+        return parsed
+    return payload
+    parts = re.findall(r"\S+\s*", cleaned)
+    for part in parts:
+        ndjson_event(
+            handler,
+            {
+                "type": "reasoning_stream",
+                "token": "word",
+                "stage": stage,
+                "stream_id": stream_id,
+                "text": part,
+            },
+        )
+    ndjson_event(
+        handler,
+        {
+            "type": "reasoning_stream",
+            "token": "end",
+            "stage": stage,
+            "stream_id": stream_id,
+        },
+    )
 
 
 def read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
@@ -134,7 +237,7 @@ def ensure_prefixed_directory_name(path_value: Path, *, label: str) -> None:
         raise ValueError(f"Warning: {label} must start with 'lch_'")
 
 
-def summarize_structure(root: Path, *, max_entries: int = 250) -> str:
+def summarize_structure(root: Path, *, max_entries: int = 120) -> str:
     rows: list[str] = []
     count = 0
     for path in sorted(root.rglob("*")):
@@ -260,7 +363,6 @@ def _is_live_action_ready(tool_name: str, arguments: dict[str, Any]) -> bool:
         "validate_web_app": ["app_dir"],
         "run_unit_tests": ["test_file"],
         "plan_web_build": ["summary"],
-        "scaffold_web_app": ["app_dir"],
     }
     required = required_args.get(tool_name)
     if not required:
@@ -364,6 +466,17 @@ def _extract_response_envelopes(text: str) -> dict[str, Any]:
             for item in payload:
                 consume_payload(item)
             return
+        if isinstance(payload, str):
+            nested = payload.strip()
+            if not nested:
+                return
+            nested_payloads = _extract_json_payloads(nested)
+            if nested_payloads:
+                for nested_payload in nested_payloads:
+                    consume_payload(nested_payload)
+                return
+            reasons.append(nested)
+            return
         if not isinstance(payload, dict):
             return
 
@@ -378,6 +491,15 @@ def _extract_response_envelopes(text: str) -> dict[str, Any]:
             chat_text = str(payload.get("text", payload.get("message", payload.get("content", "")))).strip()
             if chat_text:
                 chats.append(chat_text)
+            return
+
+        if payload_type in {"signal", "control"}:
+            signal_text = str(payload.get("message", payload.get("text", payload.get("reason", "")))).strip()
+            signal_value = str(payload.get("signal", payload.get("status", payload.get("state", "")))).strip()
+            if signal_text:
+                chats.append(signal_text)
+            elif signal_value:
+                chats.append(signal_value)
             return
 
         if payload_type == "tool":
@@ -397,6 +519,14 @@ def _extract_response_envelopes(text: str) -> dict[str, Any]:
                 if key not in seen_tools:
                     seen_tools.add(key)
                     tools.append((name, args))
+            return
+
+        if str(payload.get("action", "")).strip().lower() == "call_tool":
+            tool_name = _normalize_tool_token(str(payload.get("tool", "")).strip())
+            nested_result = payload.get("result", {})
+            rendered = _render_tool_result_text(tool_name=tool_name, result=nested_result)
+            if rendered:
+                reasons.append(rendered)
             return
 
         # Fallback non-typed tool shape
@@ -430,19 +560,62 @@ def _extract_response_envelopes(text: str) -> dict[str, Any]:
     }
 
 
+def _render_tool_result_text(*, tool_name: str, result: Any) -> str:
+    if not isinstance(result, dict):
+        return ""
+    summary = str(result.get("summary", "")).strip()
+    lines: list[str] = []
+    if tool_name:
+        lines.append(f"Tool result: {tool_name}")
+    if summary:
+        lines.append(f"Summary: {summary}")
+
+    file_structure = result.get("file_structure")
+    if isinstance(file_structure, dict) and file_structure:
+        lines.append("Planned files:")
+        for rel, desc in file_structure.items():
+            rel_text = str(rel).strip()
+            if not rel_text:
+                continue
+            desc_text = str(desc).strip()
+            if desc_text:
+                lines.append(f"- {rel_text}: {desc_text}")
+            else:
+                lines.append(f"- {rel_text}")
+
+    for key in ("elements", "css_features", "js_features", "test_cases", "prompt_features", "phases"):
+        value = result.get(key)
+        if isinstance(value, list) and value:
+            if not any(line == "Key features:" for line in lines):
+                lines.append("Key features:")
+            for item in value[:10]:
+                text = str(item).strip()
+                if text:
+                    lines.append(f"- {text}")
+
+    return "\n".join(lines)
+
+
 def _unwrap_response_payload(raw_text: str) -> str:
     payload = raw_text.strip()
     if not payload:
         return ""
-    try:
-        parsed = json.loads(payload)
-    except json.JSONDecodeError:
-        return payload
-    if isinstance(parsed, dict) and "content" in parsed:
-        return str(parsed.get("content", ""))
-    if isinstance(parsed, str):
-        return parsed
-    return payload
+
+    current = payload
+    for _ in range(4):
+        try:
+            parsed = json.loads(current)
+        except json.JSONDecodeError:
+            break
+        if isinstance(parsed, dict) and "content" in parsed:
+            current = str(parsed.get("content", ""))
+            continue
+        if isinstance(parsed, str):
+            current = parsed
+            continue
+        break
+
+    return current
 
 
 def _extract_chat_text_for_ui(final_message: str) -> str:
@@ -455,11 +628,44 @@ def _extract_chat_text_for_ui(final_message: str) -> str:
     return final_message
 
 
+def _build_completion_summary(*, status: str, final_message: str, tool_trace: list[dict[str, Any]]) -> str:
+    """Build the final chat message shown to the user.
+
+    If the orchestrator returned a rich LLM-generated summary (final_message),
+    use it directly. Only fall back to a template when the message is missing
+    or the run was stopped.
+    """
+    if status in {"stopped_no_progress", "stopped_by_agent"}:
+        return final_message.strip() if final_message.strip() else "Run stopped."
+
+    cleaned = final_message.strip()
+    # Strip leading 'DONE:' prefix if present — the summary should stand on its own
+    if cleaned.upper().startswith("DONE:"):
+        cleaned = cleaned[5:].strip()
+    if cleaned:
+        return cleaned
+
+    # Fallback when no LLM summary was produced
+    changed_files: set[str] = set()
+    for item in tool_trace:
+        if not isinstance(item, dict):
+            continue
+        tool_name = str(item.get("tool", "")).strip()
+        arguments = item.get("arguments", {})
+        if isinstance(arguments, dict) and tool_name == "create_file":
+            rel = str(arguments.get("relative_path", "")).strip()
+            if rel:
+                changed_files.add(rel)
+    if changed_files:
+        return "**Run completed.** Files updated: " + ", ".join(sorted(changed_files))
+    return "Run completed."
+
+
 def build_task_with_context(user_message: str) -> str:
     with STATE.lock:
         project = STATE.current_project
         structure = STATE.project_structure_summary
-        history = list(STATE.chat_history[-8:])
+        history = list(STATE.chat_history[-4:])
 
     if project is None:
         raise ValueError("No project is currently open")
@@ -474,40 +680,26 @@ def build_task_with_context(user_message: str) -> str:
     history_lines = []
     for item in history:
         role = item.get("role", "unknown")
-        content = item.get("content", "")[:500]
+        content = item.get("content", "")[:250]
         history_lines.append(f"- {role}: {content}")
     history_text = "\n".join(history_lines) if history_lines else "- none"
 
     return (
-        "Project context follows. Learn and use this workspace structure for all edits.\n"
+        "Project context follows. Use this workspace structure for edits.\n"
         f"Workspace absolute path: {project}\n"
         f"{landing_line}\n"
         "Workspace structure:\n"
         f"{structure}\n\n"
-        "Conversation memory (ephemeral for current app session):\n"
+        "Recent conversation memory:\n"
         f"{history_text}\n\n"
-        "Build policy:\n"
-        "- Work in major development phases with substantial code batches.\n"
-        "- Start with a concrete multi-phase plan, then execute one phase in larger chunks before moving on.\n"
-        "- Do validation/testing at phase checkpoints, not after every minor file change.\n"
-        "- Do not finish after scaffold/placeholder output.\n"
-        "- For note apps, implement create/edit/delete/manage flows with functional UI + behavior.\n"
-        "- Add a real JS test file (tests.js or *.test.js) and run it before DONE.\n\n"
-        "Response protocol (STRICT JSON only):\n"
-        "- Every assistant response must be JSON (object or array of objects).\n"
-        "- Use envelope objects with field `type`:\n"
-        "  - {\"type\":\"reason\",\"text\":\"...\"} for reasoning/planning/debug thoughts.\n"
-        "  - {\"type\":\"tool\",\"name\":\"tool_name\",\"arguments\":{...}} for tool calls.\n"
-        "  - {\"type\":\"chat\",\"text\":\"...\"} for user-facing chat summaries.\n"
-        "- During planning/reasoning phases, always inspect workspace first:\n"
-        "  1) call list_directory on '.' (and relevant subdirs),\n"
-        "  2) decide which files matter,\n"
-        "  3) call read_file for those files before implementing.\n"
-        "- Keep reasoning conversational English in `type=reason` (not raw tool JSON).\n"
-        "- Emit `type=chat` only when run is finishing or when blockers/errors must be reported to user.\n\n"
+        "Constraints:\n"
+        "- Build frontend-only HTML/CSS/JS unless user asks otherwise.\n"
+        "- Keep reasoning conversational in type=reason.\n"
+        "- Use strict JSON envelopes for reason/tool/chat/signal.\n"
+        "- Prefer focused, phase-sized edits and verify with available tools.\n\n"
         "User request:\n"
         f"{user_message}\n\n"
-        "Return phased progress through tool usage and finish with DONE: when complete."
+        "Return progress through tools and finish with signal=complete when complete."
     )
 
 
@@ -521,17 +713,56 @@ class UiHandler(BaseHTTPRequestHandler):
         if parsed.path == "/script.js":
             return self._serve_static("script.js", "application/javascript; charset=utf-8")
         if parsed.path == "/api/status":
-            chooser = folder_chooser_capability()
             with STATE.lock:
                 payload = {
                     "ok": True,
                     "workspaces_root": str(STATE.workspaces_root),
+                    "desktop_path": str(_find_desktop()),
                     "current_project": str(STATE.current_project) if STATE.current_project else None,
+                    "current_project_name": STATE.current_project.name if STATE.current_project else None,
                     "main_html": str(resolve_main_html(STATE.current_project)) if STATE.current_project else None,
-                    "folder_chooser_available": bool(chooser.get("available", False)),
-                    "folder_chooser_reason": str(chooser.get("reason", "")),
+                    # Browser-based folder picker is always available regardless of runtime
+                    "folder_chooser_available": True,
+                    "folder_chooser_reason": "",
                 }
             return json_response(self, HTTPStatus.OK, payload)
+        if parsed.path == "/api/browse-dir":
+            qs = parse_qs(parsed.query)
+            path_arg = qs.get("path", [""])[0].strip()
+            # Default start: workspaces root or home
+            if not path_arg:
+                with STATE.lock:
+                    path_arg = str(STATE.workspaces_root)
+            try:
+                browse_path = Path(path_arg).expanduser().resolve()
+                if not browse_path.exists() or not browse_path.is_dir():
+                    # Try to fall back to parent until we find something real
+                    fallback = browse_path.parent
+                    while not fallback.exists() and fallback != fallback.parent:
+                        fallback = fallback.parent
+                    browse_path = fallback if fallback.is_dir() else Path("/")
+                entries: list[dict[str, Any]] = []
+                for child in sorted(browse_path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+                    if child.name.startswith("."):
+                        continue
+                    entries.append({"name": child.name, "is_dir": child.is_dir()})
+                parent_path = str(browse_path.parent) if browse_path.parent != browse_path else None
+                return json_response(self, HTTPStatus.OK, {
+                    "ok": True,
+                    "path": str(browse_path),
+                    "parent": parent_path,
+                    "entries": entries,
+                })
+            except PermissionError:
+                return json_response(self, HTTPStatus.OK, {
+                    "ok": False,
+                    "error": "Permission denied reading that directory",
+                })
+            except Exception as browse_error:
+                return json_response(self, HTTPStatus.OK, {
+                    "ok": False,
+                    "error": str(browse_error),
+                })
         if parsed.path.startswith("/workspace/"):
             relative = parsed.path.removeprefix("/workspace/")
             return self._serve_workspace_file(relative)
@@ -665,6 +896,7 @@ class UiHandler(BaseHTTPRequestHandler):
 
                 env = os.environ.copy()
                 env["ORCHESTRATOR_FAST_MODE"] = "1"
+                env.setdefault("ORCHESTRATOR_AGENT_NUM_CTX", "40000")
 
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
@@ -687,6 +919,67 @@ class UiHandler(BaseHTTPRequestHandler):
                     STATE.stop_requested = False
 
                 streamed_action_keys: set[str] = set()
+                reasoning_stream_counter = 0
+                active_reasoning_streams: dict[str, str] = {}
+                stages_with_live_stream: set[str] = set()
+
+                def emit_reasoning_stream_chunk(*, stage: str, chunk_text: str, raw_chunk: bool = False) -> None:
+                    nonlocal reasoning_stream_counter
+                    cleaned = chunk_text if isinstance(chunk_text, str) else str(chunk_text)
+                    if not cleaned:
+                        return
+                    stream_id = active_reasoning_streams.get(stage)
+                    if stream_id is None:
+                        reasoning_stream_counter += 1
+                        stream_id = f"{stage}-live-{reasoning_stream_counter}"
+                        active_reasoning_streams[stage] = stream_id
+                        ndjson_event(
+                            self,
+                            {
+                                "type": "reasoning_stream",
+                                "token": "start",
+                                "stage": stage,
+                                "stream_id": stream_id,
+                            },
+                        )
+                    if raw_chunk:
+                        ndjson_event(
+                            self,
+                            {
+                                "type": "reasoning_stream",
+                                "token": "chunk",
+                                "stage": stage,
+                                "stream_id": stream_id,
+                                "text": cleaned,
+                            },
+                        )
+                    else:
+                        for part in re.findall(r"\S+\s*", cleaned):
+                            ndjson_event(
+                                self,
+                                {
+                                    "type": "reasoning_stream",
+                                    "token": "word",
+                                    "stage": stage,
+                                    "stream_id": stream_id,
+                                    "text": part,
+                                },
+                            )
+                    stages_with_live_stream.add(stage)
+
+                def close_reasoning_stage(stage: str) -> None:
+                    stream_id = active_reasoning_streams.pop(stage, None)
+                    if not stream_id:
+                        return
+                    ndjson_event(
+                        self,
+                        {
+                            "type": "reasoning_stream",
+                            "token": "end",
+                            "stage": stage,
+                            "stream_id": stream_id,
+                        },
+                    )
 
                 assert process.stderr is not None
                 stderr_lines: list[str] = []
@@ -699,29 +992,91 @@ class UiHandler(BaseHTTPRequestHandler):
                     stderr_lines.append(line)
                     stripped = line.strip()
                     if "[stream:planner]" in stripped:
-                        text = stripped.replace("[stream:planner]", "").strip()
-                        ndjson_event(self, {"type": "reasoning", "stage": "planner", "text": text})
+                        text = _parse_stream_chunk_text(stripped.replace("[stream:planner]", "").strip())
+                        if text:
+                            ndjson_event(self, {"type": "reasoning", "stage": "planner", "text": text})
                         ndjson_event(self, {"type": "status", "state": "thinking", "label": "thinking..."})
                     elif "[stream:reranker]" in stripped:
-                        text = stripped.replace("[stream:reranker]", "").strip()
-                        ndjson_event(self, {"type": "reasoning", "stage": "reranker", "text": text})
+                        text = _parse_stream_chunk_text(stripped.replace("[stream:reranker]", "").strip())
+                        if text:
+                            ndjson_event(self, {"type": "reasoning", "stage": "reranker", "text": text})
                         ndjson_event(self, {"type": "status", "state": "tools", "label": "getting tools..."})
+                    elif "[stream_raw:architect]" in stripped:
+                        text = stripped.replace("[stream_raw:architect]", "", 1).strip()
+                        if text:
+                            ndjson_event(self, {"type": "reasoning", "stage": "architect", "text": text})
+                        ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
+                    elif "[stream_raw:coder]" in stripped:
+                        text = stripped.replace("[stream_raw:coder]", "", 1).strip()
+                        if text:
+                            ndjson_event(self, {"type": "reasoning", "stage": "coder", "text": text})
+                        ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
+                    elif "[stream:architect]" in stripped:
+                        text = _parse_stream_chunk_text(stripped.replace("[stream:architect]", "").strip())
+                        if text:
+                            ndjson_event(self, {"type": "reasoning", "stage": "architect", "text": text})
+                        ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
+                    elif "[stream:coder]" in stripped:
+                        text = _parse_stream_chunk_text(stripped.replace("[stream:coder]", "").strip())
+                        if text:
+                            ndjson_event(self, {"type": "reasoning", "stage": "coder", "text": text})
+                        ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
+                    elif "[tool:call]" in stripped:
+                        payload_text = stripped.replace("[tool:call]", "").strip()
+                        try:
+                            parsed_tool = json.loads(payload_text)
+                        except json.JSONDecodeError:
+                            parsed_tool = {}
+                        tool_name = _normalize_tool_token(str(parsed_tool.get("name", "")).strip())
+                        tool_args_raw = parsed_tool.get("arguments", {})
+                        tool_args = tool_args_raw if isinstance(tool_args_raw, dict) else {}
+                        tool_args = _normalize_tool_arguments(tool_name, tool_args)
+                        if tool_name:
+                            event_key = json.dumps({"tool": tool_name, "arguments": tool_args}, sort_keys=True)
+                            if event_key not in streamed_action_keys:
+                                streamed_action_keys.add(event_key)
+                                ndjson_event(
+                                    self,
+                                    {
+                                        "type": "action",
+                                        "tool": tool_name,
+                                        "arguments": tool_args,
+                                        "live": True,
+                                    },
+                                )
                     elif "[status:agent]" in stripped or "[status:recovery]" in stripped:
                         ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
                     elif "[response:recovery]" in stripped:
                         text = _unwrap_response_payload(stripped.replace("[response:recovery]", "").strip())
                         if text:
                             envelopes = _extract_response_envelopes(text)
-                            for reason_text in envelopes.get("reasons", []):
-                                ndjson_event(self, {"type": "reasoning", "stage": "recovery", "text": str(reason_text)})
+                            reason_items = envelopes.get("reasons", []) if isinstance(envelopes, dict) else []
+                            if isinstance(reason_items, list) and reason_items:
+                                for reason_text in reason_items:
+                                    ndjson_event(self, {"type": "reasoning", "stage": "recovery", "text": str(reason_text)})
+                            else:
+                                ndjson_event(self, {"type": "reasoning", "stage": "recovery", "text": text})
                         ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
                     elif "[response:agent]" in stripped:
-                        text = _unwrap_response_payload(stripped.replace("[response:agent]", "").strip())
+                        raw_agent_payload = stripped.replace("[response:agent]", "").strip()
+                        # Extract embedded stage from the JSON payload if present
+                        embedded_stage = "agent"
+                        try:
+                            _payload_obj = json.loads(raw_agent_payload)
+                            if isinstance(_payload_obj, dict) and "stage" in _payload_obj:
+                                embedded_stage = str(_payload_obj["stage"]).strip() or "agent"
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                        text = _unwrap_response_payload(raw_agent_payload)
                         envelopes: dict[str, Any] = {"reasons": [], "tools": []}
                         if text:
                             envelopes = _extract_response_envelopes(text)
-                            for reason_text in envelopes.get("reasons", []):
-                                ndjson_event(self, {"type": "reasoning", "stage": "agent", "text": str(reason_text)})
+                            reason_items = envelopes.get("reasons", []) if isinstance(envelopes, dict) else []
+                            if isinstance(reason_items, list) and reason_items:
+                                for reason_text in reason_items:
+                                    ndjson_event(self, {"type": "reasoning", "stage": embedded_stage, "text": str(reason_text)})
+                            else:
+                                ndjson_event(self, {"type": "reasoning", "stage": embedded_stage, "text": text})
                         ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
                         # Parse tool calls from complete typed response text
                         for tc_name, tc_args in envelopes.get("tools", []):
@@ -752,10 +1107,19 @@ class UiHandler(BaseHTTPRequestHandler):
                                                 "live": True,
                                             },
                                         )
+                    elif "[response:coder]" in stripped:
+                        text = _unwrap_response_payload(stripped.replace("[response:coder]", "").strip())
+                        if text:
+                            ndjson_event(self, {"type": "reasoning", "stage": "agent", "text": text})
+                        ndjson_event(self, {"type": "status", "state": "working", "label": "working..."})
 
                 assert process.stdout is not None
                 stdout_raw = process.stdout.read().strip()
                 process.wait(timeout=5)
+                process_exit_code = int(process.returncode or 0)
+
+                for stream_stage in list(active_reasoning_streams.keys()):
+                    close_reasoning_stage(stream_stage)
 
                 with STATE.lock:
                     stopped_by_user = STATE.stop_requested
@@ -771,16 +1135,43 @@ class UiHandler(BaseHTTPRequestHandler):
 
                 if parsed_result is None:
                     if stopped_by_user:
-                        ndjson_event(self, {"type": "stopped", "message": "Execution stopped by user."})
+                        stopped_message = "Execution stopped by user."
+                        ndjson_event(self, {"type": "stopped", "message": stopped_message})
+                        ndjson_event(self, {"type": "chat_chunk", "text": stopped_message})
+                        ndjson_event(self, {"type": "chat_final", "text": stopped_message})
                         ndjson_event(self, {"type": "status", "state": "idle", "label": "stopped"})
                         ndjson_event(self, {"type": "done"})
                         return
+
+                    stderr_joined = "".join(stderr_lines)
+                    stderr_tail = stderr_joined[-2500:].strip()
+                    stderr_hints = [
+                        line.strip()
+                        for line in stderr_joined.splitlines()
+                        if line.strip() and not line.strip().startswith("[stream") and not line.strip().startswith("[status:")
+                    ]
+                    diagnostic = stderr_hints[-1] if stderr_hints else ""
+                    if process_exit_code != 0 and diagnostic:
+                        lowered = diagnostic.lower()
+                        if "does not support tools" in lowered or "doesn't support tools" in lowered:
+                            message = (
+                                "Selected model does not support tool calling (required for this agent). "
+                                "Set ORCHESTRATOR_MODEL to a tool-capable model (for example: qwen2.5-coder:14b). "
+                                f"Details: {diagnostic}"
+                            )
+                        else:
+                            message = f"Orchestrator failed (exit {process_exit_code}): {diagnostic}"
+                    elif process_exit_code != 0:
+                        message = f"Orchestrator failed (exit {process_exit_code}) before returning JSON result"
+                    else:
+                        message = "Unable to parse orchestrator result"
+
                     ndjson_event(
                         self,
                         {
                             "type": "error",
-                            "message": "Unable to parse orchestrator result",
-                            "detail": stdout_raw[-1000:] if stdout_raw else "",
+                            "message": message,
+                            "detail": (stdout_raw[-1000:] if stdout_raw else stderr_tail),
                         },
                     )
                     ndjson_event(self, {"type": "done"})
@@ -819,10 +1210,13 @@ class UiHandler(BaseHTTPRequestHandler):
                             nested = result_payload.get("result") if isinstance(result_payload, dict) else None
                             if isinstance(nested, dict):
                                 terminal_lines: list[str] = []
+                                terminal_lines.append(f"tool={tool_name} ok={bool(nested.get('ok', False))}")
                                 stdout_text = str(nested.get("stdout", "")).strip()
                                 stderr_text = str(nested.get("stderr", "")).strip()
                                 error_payload = nested.get("error")
                                 error_message = ""
+                                missing_files = nested.get("missing_files")
+                                issues = nested.get("issues")
                                 if isinstance(error_payload, dict):
                                     error_message = str(error_payload.get("message", "")).strip()
                                 elif isinstance(error_payload, str):
@@ -834,6 +1228,14 @@ class UiHandler(BaseHTTPRequestHandler):
                                     terminal_lines.append(stderr_text)
                                 if error_message:
                                     terminal_lines.append(error_message)
+                                if isinstance(missing_files, list) and missing_files:
+                                    terminal_lines.append(
+                                        "missing_files: " + ", ".join(str(item) for item in missing_files)
+                                    )
+                                if isinstance(issues, list) and issues:
+                                    terminal_lines.append(
+                                        "issues: " + " | ".join(str(item) for item in issues)
+                                    )
 
                                 for block in terminal_lines:
                                     for line in block.splitlines():
@@ -844,14 +1246,8 @@ class UiHandler(BaseHTTPRequestHandler):
                                             if dedupe_key in terminal_line_keys:
                                                 continue
                                             terminal_line_keys.add(dedupe_key)
-                                            ndjson_event(
-                                                self,
-                                                {
-                                                    "type": "reasoning",
-                                                    "stage": "terminal",
-                                                    "text": terminal_text,
-                                                },
-                                            )
+                                            reasoning_stream_counter += 1
+                                            ndjson_event(self, {"type": "reasoning", "stage": "terminal", "text": terminal_text})
 
                         if tool_name == "create_file" and isinstance(arguments, dict):
                             rel = str(arguments.get("relative_path", "")).strip()
@@ -869,6 +1265,11 @@ class UiHandler(BaseHTTPRequestHandler):
                 final_message = _extract_chat_text_for_ui(final_message_raw).strip()
                 if not final_message:
                     final_message = "No final response returned."
+                summary_message = _build_completion_summary(
+                    status=status,
+                    final_message=final_message,
+                    tool_trace=tool_trace if isinstance(tool_trace, list) else [],
+                )
 
                 if status in {"stopped_no_progress", "stopped_by_agent"}:
                     ndjson_event(
@@ -880,7 +1281,7 @@ class UiHandler(BaseHTTPRequestHandler):
                     )
                     ndjson_event(self, {"type": "status", "state": "idle", "label": "stopped"})
 
-                words = final_message.split(" ")
+                words = summary_message.split(" ")
                 chunk = ""
                 for word in words:
                     if chunk:
@@ -890,11 +1291,11 @@ class UiHandler(BaseHTTPRequestHandler):
                     ndjson_event(self, {"type": "chat_chunk", "text": chunk})
 
                 with STATE.lock:
-                    STATE.chat_history.append({"role": "assistant", "content": final_message})
+                    STATE.chat_history.append({"role": "assistant", "content": summary_message})
                     STATE.active_process = None
                     STATE.stop_requested = False
 
-                ndjson_event(self, {"type": "chat_final", "text": final_message})
+                ndjson_event(self, {"type": "chat_final", "text": summary_message})
                 final_label = "stopped" if status in {"stopped_no_progress", "stopped_by_agent"} else "done"
                 ndjson_event(self, {"type": "status", "state": "idle", "label": final_label})
                 ndjson_event(self, {"type": "done"})

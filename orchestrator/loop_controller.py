@@ -1,6 +1,14 @@
+"""Two-stage pipeline agent for building HTML/CSS/JS apps.
+
+Pipeline:
+  1. Detect workspace state (empty vs populated)
+  2. Plan — one comprehensive planning pass
+  3. Code — write all files in a single pass
+  4. Done
+"""
+
 from __future__ import annotations
 
-import difflib
 import json
 import os
 import re
@@ -27,6 +35,52 @@ TOOL_NAME_ALIASES: dict[str, str] = {
     "list_files": "list_directory",
 }
 
+# Two ordered pipeline stages
+STAGES: list[tuple[str, str]] = [
+    ("plan", "Create a comprehensive, detailed plan for the project"),
+    ("code", "Write all necessary files in one pass using create_file"),
+]
+
+# Tools allowed per stage
+STAGE_TOOLS: dict[str, list[str]] = {
+    "plan": ["plan_web_build", "read_file", "list_directory"],
+    "code": ["create_file"],
+}
+
+SYSTEM_PROMPT = (
+    "You are a frontend coding agent that builds HTML/CSS/JS web apps.\n"
+    "You work in two stages: first you plan thoroughly, then you write all files.\n"
+    "\n"
+    "CRITICAL RULES:\n"
+    "- Use RELATIVE paths only (e.g. 'index.html', 'styles.css', 'script.js').\n"
+    "  NEVER use absolute paths like /root/Desktop/... or /home/user/...\n"
+    "- Planning stage: reason about what to build. Be comprehensive and detailed.\n"
+    "  Cover every feature, every element ID, every function, every connection.\n"
+    "- Coding stage: use the create_file tool to write COMPLETE file contents.\n"
+    "  Write ALL files (HTML, CSS, JS) in one pass. Every file must be complete.\n"
+    "- Always generate code that matches the planned features exactly.\n"
+    "- Keep reasoning in plain text, no JSON envelopes.\n"
+    "- Do NOT prefix lines with 'type=reason' or 'type=signal'.\n"
+    "- Use only the tools provided for each stage.\n"
+    "- For create_file: always write the full file, not partial snippets.\n"
+    "\n"
+    "HTML RULES:\n"
+    "- Give EVERY interactive element a unique, descriptive id attribute.\n"
+    "- Use semantic HTML5 (<header>, <main>, <section>, <form>, <footer>).\n"
+    "- Link stylesheet: <link rel=\"stylesheet\" href=\"styles.css\"> in <head>.\n"
+    "- Link script: <script src=\"script.js\"></script> before </body>.\n"
+    "\n"
+    "CSS RULES:\n"
+    "- Target the exact IDs, classes, and elements from your HTML.\n"
+    "- Do NOT invent selectors for elements that don't exist.\n"
+    "- Include responsive design and clean typography.\n"
+    "\n"
+    "JAVASCRIPT RULES:\n"
+    "- script.js must reference the exact element IDs from index.html.\n"
+    "- Separate pure logic (data manipulation, validation) into named functions.\n"
+    "- Export logic functions: if (typeof module !== 'undefined') { module.exports = { fn1, fn2 }; }\n"
+)
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "").strip()
@@ -40,6 +94,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 class LoopController:
+    """Two-stage pipeline controller.
+
+    Detects whether the workspace is empty (new project) or populated
+    (existing project), then runs: Plan -> Code -> Done.
+    """
+
     def __init__(
         self,
         *,
@@ -66,1302 +126,690 @@ class LoopController:
         self.candidate_pool_size = candidate_pool_size
         self.workspace_root_path = Path(workspace_root).expanduser().resolve()
 
+        # Project memory for file-level semantic retrieval
+        events_log = project_root / "logs" / "project_memory.log"
+        self.project_memory = ProjectMemory(
+            workspace_root=self.workspace_root_path,
+            ollama_client=ollama_client,
+            embedding_model=os.environ.get("EMBEDDING_MODEL", "nomic-embed-text"),
+            events_log_path=events_log,
+        )
+
+        # Index tools by name for quick lookup
+        self._tools_by_name: dict[str, dict[str, Any]] = {}
+        for tool in tools:
+            name = str(tool.get("function", {}).get("name", ""))
+            if name:
+                self._tools_by_name[name] = tool
+
+    # ------------------------------------------------------------------
+    # Workspace detection
+    # ------------------------------------------------------------------
+
+    def _detect_workspace_state(self) -> dict[str, Any]:
+        """Detect whether the workspace is empty or populated.
+
+        Returns:
+            {
+                "is_empty": bool,
+                "files": list[str],        -- relative paths of existing files
+                "file_contents": dict,      -- {rel_path: content} for key files
+            }
+        """
+        ignored = {
+            ".git", ".venv", "venv", "node_modules", "__pycache__",
+            ".low-cortisol-html-logs", ".DS_Store",
+        }
+        files: list[str] = []
+        for path in sorted(self.workspace_root_path.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = str(path.relative_to(self.workspace_root_path).as_posix())
+            if any(
+                part.startswith(".") or part in ignored
+                for part in rel.split("/")
+            ):
+                continue
+            files.append(rel)
+
+        is_empty = len(files) == 0
+
+        # For populated workspaces, read key file contents
+        file_contents: dict[str, str] = {}
+        if not is_empty:
+            code_extensions = {".html", ".css", ".js", ".json", ".md", ".txt"}
+            for rel in files[:30]:  # cap to avoid huge context
+                ext = Path(rel).suffix.lower()
+                if ext not in code_extensions:
+                    continue
+                fpath = self.workspace_root_path / rel
+                try:
+                    content = fpath.read_text(encoding="utf-8", errors="replace")
+                    if len(content) > 10000:
+                        content = content[:10000] + "\n... (truncated)"
+                    file_contents[rel] = content
+                except OSError:
+                    continue
+
+        return {
+            "is_empty": is_empty,
+            "files": files,
+            "file_contents": file_contents,
+        }
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
     def run(self, task: str) -> dict[str, Any]:
         memory = SessionMemory()
-        memory.add(
-            "system",
-            (
-                "You are an autonomous coding agent running a Reason→Create→Debug loop. "
-                "Use tools when needed, reason step-by-step, and keep iterating until the task is truly complete. "
-                "Do not only describe intended actions; call tools directly whenever work is required. "
-                "Implement requested features in substantial phase-sized batches rather than tiny edits. "
-                "Do not stop after basic scaffolding or placeholder output. "
-                "Only return DONE after requested functionality is fully implemented and verified with validation and real tests. "
-                "When finished, return a final message that starts with 'DONE:'. "
-                "Never claim completion using plain prose only; completion must use the explicit 'DONE:' prefix. "
-                "If execution is blocked and cannot continue, use explicit 'STOP:' with a short reason. "
-                "All assistant responses must be strict JSON objects or arrays. "
-                "Use typed envelopes: "
-                "{\"type\":\"reason\",\"text\":\"...\"} for internal planning/reasoning, "
-                "{\"type\":\"tool\",\"name\":\"tool_name\",\"arguments\":{...}} for tool calls, "
-                "and {\"type\":\"chat\",\"text\":\"...\"} for user-facing chat. "
-                "Keep type=reason conversational and concise; never dump raw tool JSON in reason text. "
-                "Prefer structured incremental edit tools (replace_range, insert_after_marker, append_to_file) over full-file rewrites. "
-                "Only use create_file full rewrite when creating a new file or when explicitly required for full replacement."
-            ),
-        )
-        memory.add("user", task)
-
-        events_log_path = self.workspace_root_path / ".low-cortisol-html-logs" / "orchestrator_events.log"
-        project_memory = ProjectMemory(
-            workspace_root=self.workspace_root_path,
-            ollama_client=self.ollama_client,
-            embedding_model=os.environ.get("EMBEDDING_MODEL", "nomic-embed-text"),
-            events_log_path=events_log_path,
-        )
+        memory.add("system", SYSTEM_PROMPT)
+        memory.add("user", f"Task: {task}")
 
         tool_trace: list[dict[str, Any]] = []
-        selection_trace: list[dict[str, Any]] = []
-        repair_events: list[dict[str, Any]] = []
-        development_phases: list[str] = []
         iteration = 0
-        max_tool_calls_per_iteration = int(os.environ.get("ORCHESTRATOR_MAX_TOOL_CALLS_PER_ITERATION", "8"))
-        phase_plan_ready = False
-        changed_since_validation: set[str] = set()
-        changed_since_tests: set[str] = set()
-        validation_runs = 0
-        tests_runs = 0
-        last_validation_ok = False
-        validation_ever_passed = False
-        consecutive_validation_deferrals = 0
-        consecutive_test_deferrals = 0
-        total_validation_deferrals = 0
-        total_test_deferrals = 0
-        max_total_deferrals = 4
-        no_progress_iterations = 0
-        max_no_progress_iterations = int(os.environ.get("ORCHESTRATOR_MAX_NO_PROGRESS_ITERATIONS", "6"))
-        recent_tool_call_signatures: list[str] = []
-        max_repeated_signatures = 3
-        planning_entries: list[str] = []
-        file_generation: dict[str, int] = {}
-        file_read_generation: dict[str, int] = {}
-        last_create_file_signature: dict[str, str] = {}
-        last_structured_edit_signature: dict[str, str] = {}
-        plan_loop_iterations = 0
-        new_project_hint_sent = False
-        started_from_empty = self._is_workspace_empty()
-        substantive_edit_count = 0
+        created_files: set[str] = set()
+        max_tool_calls = _env_int("ORCHESTRATOR_MAX_TOOL_CALLS_PER_ITERATION", 12)
 
-        while True:
-            iteration += 1
-            project_memory.refresh()
-            workspace_is_empty = self._is_workspace_empty()
-            plan = self.planner.plan_step(task=task, iteration=iteration, recent_messages=memory.messages)
-            retrieval_query = str(plan.get("retrieval_query", "")).strip() or task
-            if not development_phases:
-                candidate_phases = plan.get("development_phases", [])
-                if isinstance(candidate_phases, list):
-                    development_phases = [str(item) for item in candidate_phases if str(item).strip()]
+        # --- Detect workspace state ---
+        workspace_state = self._detect_workspace_state()
+        is_empty = workspace_state["is_empty"]
 
-            active_phase = self._select_active_phase(iteration=iteration, plan=plan, development_phases=development_phases)
-            memory.add(
-                "user",
-                (
-                    f"Current build phase: {active_phase}. "
-                    "Implement this phase in a large coherent coding batch. "
-                    f"You may use up to {max_tool_calls_per_iteration} tool calls this turn when needed. "
-                    "Do not run validate_web_app or run_unit_tests after every file edit; run them after a major phase checkpoint. "
-                    "Before major reasoning/planning decisions in this phase, inspect project state by calling list_directory on '.' and then read_file on relevant files you choose from that listing. "
-                    "When reasoning/planning, explain decisions in type=reason envelopes."
-                ),
+        if is_empty:
+            memory.add("user",
+                "Workspace is empty. This is a new project. "
+                "All files need to be created from scratch."
             )
-            if workspace_is_empty and not new_project_hint_sent:
-                memory.add(
-                    "user",
-                    (
-                        "Workspace state: NEW_PROJECT_EMPTY. Treat this as a brand-new project. "
-                        "Start by creating a coherent initial app structure (index.html, styles.css, app.js, tests.js) "
-                        "or use scaffold_web_app, then continue with phased implementation."
-                    ),
-                )
-                new_project_hint_sent = True
-
-            file_top_k = _env_int("ORCHESTRATOR_FILE_TOP_K", 6)
-            retrieved_files = project_memory.retrieve(query=retrieval_query, top_k=file_top_k)
-            retrieval_context = project_memory.build_retrieval_context(
-                retrieved=retrieved_files,
-                include_full_top_n=_env_int("ORCHESTRATOR_FILE_FULL_TOP_N", 2),
-                max_full_chars=_env_int("ORCHESTRATOR_FILE_FULL_MAX_CHARS", 12000),
+            self._emit_reasoning_raw("system", "Detected: empty workspace — new project")
+        else:
+            file_list = "\n".join(f"- {f}" for f in workspace_state["files"])
+            memory.add("user", f"Current workspace files:\n{file_list}")
+            self._emit_reasoning_raw("system",
+                f"Detected: populated workspace — {len(workspace_state['files'])} existing file(s)"
             )
-            memory.add(
-                "user",
-                "Project memory retrieval context (file-level):\n"
-                + retrieval_context,
-            )
-            project_memory.write_event(
-                stage="file_retrieval",
-                payload={
-                    "iteration": iteration,
-                    "query": retrieval_query,
-                    "top_k": file_top_k,
-                    "retrieved": [
-                        {
-                            "relative_path": str(item.get("relative_path", "")),
-                            "score": float(item.get("score", 0.0)),
-                        }
-                        for item in retrieved_files
-                    ],
-                },
-            )
-            if planning_entries:
-                recent_plan = planning_entries[-6:]
-                memory.add(
-                    "user",
-                    "Planning memory context (most recent):\n"
-                    + "\n".join(f"- {entry}" for entry in recent_plan),
-                )
-            if not phase_plan_ready:
-                memory.add(
-                    "user",
-                    "Planner mode first: produce concrete multi-phase reasoning (type=reason) and decide files to inspect. "
-                    "Do not edit files before you inspect structure and relevant files. Prefer plan_web_build only after initial reasoning.",
+            # Inject existing file contents into context
+            if workspace_state["file_contents"]:
+                parts: list[str] = []
+                for rel, content in workspace_state["file_contents"].items():
+                    parts.append(f"--- {rel} ---\n{content}\n--- end {rel} ---")
+                    created_files.add(rel)  # track as known files
+                memory.add("user",
+                    "=== EXISTING FILE CONTENTS ===\n"
+                    + "\n\n".join(parts)
+                    + "\n=== END EXISTING FILE CONTENTS ==="
                 )
 
-            retrieval = self.tool_pruner.retrieve_candidates(
-                query=retrieval_query,
-                tools=self.tools,
-                top_n=self.candidate_pool_size,
-            )
-            reranked = self.reranker.rerank(
+        # --- Run planner for initial retrieval query ---
+        planner_result: dict[str, Any] = {}
+        try:
+            print("[status:agent] running planner...", file=sys.stderr, flush=True)
+            planner_result = self.planner.plan_step(
                 task=task,
-                plan=plan,
-                candidates=retrieval["candidates"],
-                top_k=self.top_k_tools,
+                iteration=1,
+                recent_messages=memory.messages[-4:],
             )
-            selected_items = reranked["selected"]
-            selected_tools = [item["tool"] for item in selected_items]
-            if not selected_tools:
-                selected_tools = self.tools[: max(1, min(self.top_k_tools, len(self.tools)))]
+            retrieval_query = str(planner_result.get("retrieval_query", task))
+            rationale = str(planner_result.get("rationale", "")).strip()
+            if rationale:
+                self._emit_reasoning_raw("planner", f"Plan: {rationale}")
+        except Exception:
+            retrieval_query = task
+            planner_result = {}
 
-            if not phase_plan_ready:
-                prioritized: list[dict[str, Any]] = []
-                planning_tool_names = {"plan_web_build", "list_directory", "read_file"}
-                if workspace_is_empty:
-                    planning_tool_names.update({"scaffold_web_app", "create_file"})
-                prioritized.extend(
-                    [
-                        tool
-                        for tool in selected_tools
-                        if str(tool.get("function", {}).get("name", "")) in planning_tool_names
-                    ]
-                )
-                prioritized.extend(
-                    [
-                        tool
-                        for tool in self.tools
-                        if str(tool.get("function", {}).get("name", "")) in planning_tool_names
-                    ]
-                )
+        self._current_retrieval_query = retrieval_query
+        self._current_plan = planner_result
 
-                deduped: list[dict[str, Any]] = []
-                seen_names: set[str] = set()
-                for tool in prioritized:
-                    name = str(tool.get("function", {}).get("name", ""))
-                    if not name or name in seen_names:
-                        continue
-                    seen_names.add(name)
-                    deduped.append(tool)
+        # --- Execute stages ---
+        for stage_name, stage_desc in STAGES:
+            iteration += 1
 
-                if deduped:
-                    selected_tools = deduped[: max(1, min(self.top_k_tools, len(deduped)))]
+            print(f"[status:agent] stage: {stage_name}", file=sys.stderr, flush=True)
+            stage_label = stage_name.replace("_", " ").title()
+            self._emit_reasoning(stage_name, f"Starting stage: {stage_label}")
 
-                if plan_loop_iterations >= 2:
-                    forced_names = ["plan_web_build", "read_file", "list_directory"]
-                    if workspace_is_empty:
-                        forced_names = ["plan_web_build", "scaffold_web_app", "create_file", "list_directory"]
-                    forced_tools: list[dict[str, Any]] = []
-                    for forced_name in forced_names:
-                        for tool in self.tools:
-                            name = str(tool.get("function", {}).get("name", ""))
-                            if name == forced_name:
-                                forced_tools.append(tool)
-                                break
-                    for tool in selected_tools:
-                        name = str(tool.get("function", {}).get("name", ""))
-                        if name not in {"plan_web_build", "read_file", "list_directory"}:
-                            forced_tools.append(tool)
-                    if forced_tools:
-                        selected_tools = forced_tools[: max(1, min(self.top_k_tools, len(forced_tools)))]
-                    memory.add(
-                        "user",
-                        "Planning appears stalled. Now force progression: call plan_web_build and at least one read_file for a relevant file, "
-                        "then proceed with implementation planning in type=reason.",
-                    )
+            # Build stage prompt
+            stage_prompt = self._build_stage_prompt(
+                stage_name=stage_name,
+                stage_desc=stage_desc,
+                task=task,
+                created_files=created_files,
+                workspace_state=workspace_state,
+            )
+            memory.add("user", stage_prompt)
 
-            selected_tools = self._ensure_required_tools(
-                selected_tools=selected_tools,
-                phase_plan_ready=phase_plan_ready,
-                workspace_is_empty=workspace_is_empty,
+            # Get tools for this stage
+            stage_tools = self._get_pruned_tools(
+                query=f"{stage_desc} for task: {task}",
+                stage_name=stage_name,
             )
 
-            selection_event = {
-                "iteration": iteration,
-                "plan": plan,
-                "retrieval": retrieval["report"],
-                "rerank": reranked["report"],
-                "selected_tools": [
-                    str(item.get("function", {}).get("name", ""))
-                    for item in selected_tools
-                    if isinstance(item, dict)
-                ],
-            }
-            selection_trace.append(selection_event)
-            self.tool_pruner.log_event(stage="selection", payload=selection_event)
+            # Refresh project memory
+            try:
+                self.project_memory.refresh()
+            except Exception:
+                pass
 
+            # Call LLM
             print("[status:agent] calling model...", file=sys.stderr, flush=True)
+            num_predict = _env_int("ORCHESTRATOR_AGENT_NUM_PREDICT", 8192)
+            if stage_name == "code":
+                # Allow much more output for writing all files at once
+                num_predict = _env_int("ORCHESTRATOR_CODE_NUM_PREDICT", 16384)
+
             response = self.ollama_client.chat(
                 model=self.model_name,
                 messages=memory.messages,
-                tools=selected_tools,
+                tools=stage_tools,
                 stream=False,
-                num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 32768),
-                num_predict=_env_int("ORCHESTRATOR_AGENT_NUM_PREDICT", 8192),
+                num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 40000),
+                num_predict=num_predict,
             )
-            assistant_message = self.ollama_client.extract_assistant_message(response)
-            content = str(assistant_message.get("content", ""))
-            tool_calls = self.ollama_client.extract_tool_calls(assistant_message)
 
-            # Emit complete response as single block for UI reasoning display
-            if content.strip():
-                print(
-                    f"[response:agent] {json.dumps({'content': content}, ensure_ascii=False)}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+            message = self.ollama_client.extract_assistant_message(response)
+            content = str(message.get("content", ""))
+            tool_calls = self.ollama_client.extract_tool_calls(message)
 
-            reason_entries = self._extract_reason_entries(content)
-            if reason_entries:
-                planning_entries.extend(reason_entries)
-            elif tool_calls:
-                synthetic = self._build_tool_only_reasoning(tool_calls)
-                if synthetic:
-                    planning_entries.append(synthetic)
-                    print(
-                        f"[response:agent] {json.dumps({'content': json.dumps({'type': 'reason', 'text': synthetic}, ensure_ascii=False)}, ensure_ascii=False)}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-
-            # Deduplicate tool calls extracted from content (model often repeats)
+            # Normalize and deduplicate tool calls
+            tool_calls = [
+                {"name": n, "arguments": a}
+                for n, a in (self._normalize_tool_call(tc) for tc in tool_calls)
+            ]
             tool_calls = self._deduplicate_tool_calls(tool_calls)
 
-            memory.add("assistant", content, tool_calls=tool_calls)
-
-            if not tool_calls and not self._is_done_message(content):
-                recovery_content, recovered_calls = self._recover_tool_calls(memory=memory, selected_tools=selected_tools)
-                if recovery_content:
-                    content = recovery_content
-                    recovery_reason_entries = self._extract_reason_entries(recovery_content)
-                    if recovery_reason_entries:
-                        planning_entries.extend(recovery_reason_entries)
-                if recovered_calls:
-                    tool_calls = recovered_calls
-                    memory.add("assistant", content, tool_calls=tool_calls)
-
-            project_memory.write_event(
-                stage="agent_response",
-                payload={
-                    "iteration": iteration,
-                    "tool_calls": [str(item.get("name", "")) for item in tool_calls if isinstance(item, dict)],
-                    "content_preview": content[:800],
-                },
-            )
-
-            if not tool_calls:
-                if self._is_stop_message(content):
-                    return {
-                        "ok": False,
-                        "status": "stopped_by_agent",
-                        "iterations": iteration,
-                        "final_message": content,
-                        "tool_trace": tool_trace,
-                        "selection_trace": selection_trace,
-                        "repair_trace": repair_events,
-                    }
-                lowered_content = content.lower()
-                if "manual" in lowered_content and "verify" in lowered_content:
-                    memory.add(
-                        "user",
-                        (
-                            "Do not ask for manual verification while the task is incomplete. "
-                            "Use tools to create/fix files and validate within the workspace. "
-                            "Only use STOP if tooling/environment is persistently blocking progress."
-                        ),
+            # Adaptive: extract tool calls from text if model wrote them inline
+            if not tool_calls and content.strip() and stage_name == "code":
+                inline_calls = self._extract_tool_calls_from_text(content)
+                if inline_calls:
+                    tool_calls = inline_calls
+                    self._emit_reasoning(
+                        stage_name,
+                        f"Extracted {len(inline_calls)} tool call(s) from model text output",
                     )
-                    continue
 
-                if self._claims_success_without_evidence(
-                    content=content,
-                    last_validation_ok=last_validation_ok,
-                    tests_runs=tests_runs,
-                ):
-                    memory.add(
-                        "user",
-                        (
-                            "Your message claims validation/tests passed but the tool trace does not yet prove completion. "
-                            "Run validate_web_app and run_unit_tests (non-deferred), then continue implementation if needed. "
-                            "Only claim completion after evidence and respond with DONE:."
-                        ),
-                    )
-                    continue
-
-                if self._is_done_message(content):
-                    completion_gaps = self._completion_gaps(task=task, tool_trace=tool_trace, iteration=iteration)
-                    if completion_gaps:
-                        memory.add(
-                            "user",
-                            "Do not finish yet. Remaining completion requirements:\n"
-                            + "\n".join(f"- {item}" for item in completion_gaps)
-                            + "\nContinue building step-by-step and return DONE only after all are satisfied.",
-                        )
-                        continue
-                    return {
-                        "ok": True,
-                        "status": "completed",
-                        "iterations": iteration,
-                        "final_message": content,
-                        "tool_trace": tool_trace,
-                        "selection_trace": selection_trace,
-                        "repair_trace": repair_events,
-                    }
-
-                if self._looks_like_completion_without_done(content):
-                    completion_gaps = self._completion_gaps(task=task, tool_trace=tool_trace, iteration=iteration)
-                    if not completion_gaps:
-                        normalized_done = (
-                            f"DONE: {content.strip()}"
-                            if content.strip()
-                            else "DONE: Task completed and verified."
-                        )
-                        return {
-                            "ok": True,
-                            "status": "completed",
-                            "iterations": iteration,
-                            "final_message": normalized_done,
-                            "tool_trace": tool_trace,
-                            "selection_trace": selection_trace,
-                            "repair_trace": repair_events,
-                        }
-                    memory.add(
-                        "user",
-                        "You indicated completion but required checks are still missing. "
-                        "Do not claim completion until all gaps are resolved, then respond with exact 'DONE:'.",
-                    )
-                    continue
-
-                memory.add(
-                    "user",
-                    (
-                        "Task is not yet marked complete. Continue the Reason→Create→Debug loop, "
-                        "use tools as needed, and only finish with a message that starts with 'DONE:'."
-                    ),
+            # Adaptive: retry on empty response
+            if not content.strip() and not tool_calls:
+                self._emit_reasoning(stage_name, "Empty model response, retrying...")
+                nudge = (
+                    f"You did not produce any output for stage {stage_name}. "
+                    "Please complete this stage now. "
+                    "Use the tools provided as instructed."
                 )
-                continue
-
-            if not phase_plan_ready:
-                has_plan_call = any(
-                    str(call.get("name", "")) == "plan_web_build"
-                    for call in tool_calls
-                    if isinstance(call, dict)
+                memory.add("user", nudge)
+                response = self.ollama_client.chat(
+                    model=self.model_name,
+                    messages=memory.messages,
+                    tools=stage_tools,
+                    stream=False,
+                    num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 40000),
+                    num_predict=num_predict,
                 )
-                has_read_call = any(
-                    str(call.get("name", "")) == "read_file"
-                    for call in tool_calls
-                    if isinstance(call, dict)
-                )
-                if has_plan_call and has_read_call:
-                    phase_plan_ready = True
-                    plan_loop_iterations = 0
-                else:
-                    plan_loop_iterations += 1
-            else:
-                plan_loop_iterations = 0
+                message = self.ollama_client.extract_assistant_message(response)
+                content = str(message.get("content", ""))
+                tool_calls = self.ollama_client.extract_tool_calls(message)
+                tool_calls = [
+                    {"name": n, "arguments": a}
+                    for n, a in (self._normalize_tool_call(tc) for tc in tool_calls)
+                ]
+                tool_calls = self._deduplicate_tool_calls(tool_calls)
+                if not tool_calls and content.strip() and stage_name == "code":
+                    tool_calls = self._extract_tool_calls_from_text(content)
 
-            iteration_had_tool_error = False
-            iteration_had_non_edit_progress = False
-            iteration_feedback: list[dict[str, Any]] = []
-            iteration_tool_names: list[str] = []
-            iteration_changed_files = 0
-            edited_files_this_iteration: set[str] = set()
-            max_files_per_iteration = _env_int("ORCHESTRATOR_MAX_FILES_PER_ITERATION", 4)
+            # Emit reasoning to UI
+            if content.strip():
+                self._emit_reasoning(stage_name, content)
+            elif tool_calls and stage_name == "code":
+                file_names = []
+                for tc in tool_calls:
+                    tc_name = str(tc.get("name", ""))
+                    tc_args = tc.get("arguments", {})
+                    if tc_name in ("create_file", "write_file", "edit_file") and isinstance(tc_args, dict):
+                        rel = str(tc_args.get("relative_path", tc_args.get("file_path", ""))).strip()
+                        if rel:
+                            file_names.append(rel)
+                if file_names:
+                    self._emit_reasoning(stage_name, f"Writing files: {', '.join(file_names)}")
 
-            for index, call in enumerate(tool_calls):
-                if index >= max_tool_calls_per_iteration:
+            # Execute tool calls
+            allowed = set(STAGE_TOOLS.get(stage_name, []))
+            executed_count = 0
+
+            for call in tool_calls:
+                if executed_count >= max_tool_calls:
                     break
-                tool_name, arguments = self._normalize_tool_call(call)
 
-                if tool_name in {"create_file", "append_to_file", "insert_after_marker", "replace_range"}:
-                    candidate_path = str(arguments.get("relative_path", "")).strip()
-                    if (
-                        candidate_path
-                        and candidate_path not in edited_files_this_iteration
-                        and len(edited_files_this_iteration) >= max_files_per_iteration
-                    ):
-                        tool_result = self._deferred_tool_result(
-                            tool_name=tool_name,
-                            reason=(
-                                "Deferred edit to keep iteration focused. "
-                                f"Max edited files per iteration is {max_files_per_iteration}."
-                            ),
-                        )
-                        iteration_tool_names.append(tool_name)
-                        tool_trace.append(
-                            {
-                                "iteration": iteration,
-                                "tool": tool_name,
-                                "arguments": arguments,
-                                "result": tool_result,
-                            }
-                        )
-                        memory.add("tool", json.dumps(tool_result), name=tool_name)
+                name = str(call.get("name", "")).strip()
+                args = call.get("arguments", {})
+                if not isinstance(args, dict):
+                    args = {}
+
+                if name not in allowed:
+                    continue
+
+                # Skip empty file writes
+                if name == "create_file":
+                    rel = str(args.get("relative_path", "")).strip()
+                    content_val = str(args.get("content", ""))
+                    if not rel or not content_val.strip():
                         continue
 
-                if tool_name == "validate_web_app":
-                    if started_from_empty and substantive_edit_count == 0:
-                        tool_result = self._deferred_tool_result(
-                            tool_name="validate_web_app",
-                            reason=(
-                                "Project started empty and only scaffold/discovery has run so far. "
-                                "Implement real UI/JS edits first, then validate."
-                            ),
-                        )
-                        consecutive_validation_deferrals += 1
-                        total_validation_deferrals += 1
-                    else:
-                        should_run_validation = (
-                            self._should_run_validation(
-                                changed_since_validation=changed_since_validation,
-                                validation_runs=validation_runs,
-                            )
-                            or consecutive_validation_deferrals >= 2
-                            or total_validation_deferrals >= max_total_deferrals
-                        )
-                        if not should_run_validation:
-                            tool_result = self._deferred_tool_result(
-                                tool_name="validate_web_app",
-                                reason="Defer validation until after a major phase checkpoint with multiple edits.",
-                            )
-                            consecutive_validation_deferrals += 1
-                            total_validation_deferrals += 1
-                        else:
-                            tool_result = self._call_mcp_tool(tool_name, arguments)
-                            validation_runs += 1
-                            consecutive_validation_deferrals = 0
-                            nested = tool_result.get("result") if isinstance(tool_result, dict) else None
-                            last_validation_ok = bool(isinstance(nested, dict) and nested.get("ok", False))
-                            if last_validation_ok:
-                                validation_ever_passed = True
-                                changed_since_validation.clear()
-                elif tool_name == "run_unit_tests":
-                    if started_from_empty and substantive_edit_count == 0:
-                        tool_result = self._deferred_tool_result(
-                            tool_name="run_unit_tests",
-                            reason=(
-                                "Project started empty and no substantive implementation edits are present yet. "
-                                "Implement app behavior and tests first, then run unit tests."
-                            ),
-                        )
-                        consecutive_test_deferrals += 1
-                        total_test_deferrals += 1
-                    else:
-                        should_run_tests = (
-                            self._should_run_tests(
-                                changed_since_tests=changed_since_tests,
-                                tests_runs=tests_runs,
-                                last_validation_ok=last_validation_ok,
-                                validation_ever_passed=validation_ever_passed,
-                            )
-                            or consecutive_test_deferrals >= 2
-                            or total_test_deferrals >= max_total_deferrals
-                        )
-                        if not should_run_tests:
-                            tool_result = self._deferred_tool_result(
-                                tool_name="run_unit_tests",
-                                reason="Defer tests until validation passes and major implementation changes are complete.",
-                            )
-                            consecutive_test_deferrals += 1
-                            total_test_deferrals += 1
-                        else:
-                            tool_result = self._call_mcp_tool(tool_name, arguments)
-                            tests_runs += 1
-                            consecutive_test_deferrals = 0
-                            changed_since_tests.clear()
-                elif tool_name == "create_file":
-                    relative_path = str(arguments.get("relative_path", "")).strip()
-                    content_value = str(arguments.get("content", ""))
-                    signature = self._text_signature(content_value)
-                    existing_file = self._resolve_workspace_file(relative_path)
-                    previous_content = self._read_local_file(existing_file)
+                self._emit_tool_call_event(tool_name=name, arguments=args)
+                result = self._call_mcp_tool(name, args)
 
-                    if relative_path and last_create_file_signature.get(relative_path) == signature:
-                        tool_result = self._deferred_tool_result(
-                            tool_name="create_file",
-                            reason=(
-                                f"Skipped redundant rewrite for '{relative_path}' because content is identical "
-                                "to the previous write."
-                            ),
-                        )
-                    else:
-                        needs_sync_read = False
-                        if existing_file is not None and existing_file.exists() and existing_file.is_file():
-                            generation = file_generation.get(relative_path, 0)
-                            read_generation = file_read_generation.get(relative_path, -1)
-                            needs_sync_read = read_generation < generation or read_generation < 0
+                result_reasoning = self._format_tool_result_reasoning(name=name, result=result)
+                if result_reasoning:
+                    self._emit_reasoning(stage_name, result_reasoning)
 
-                        if needs_sync_read and relative_path:
-                            sync_read_args = {"relative_path": relative_path, "max_bytes": 200000}
-                            sync_read_result = self._call_mcp_tool("read_file", sync_read_args)
-                            project_memory.mark_touched(relative_path)
-                            tool_trace.append(
-                                {
-                                    "iteration": iteration,
-                                    "tool": "read_file",
-                                    "arguments": sync_read_args,
-                                    "result": sync_read_result,
-                                }
-                            )
-                            memory.add("tool", json.dumps(sync_read_result), name="read_file")
+                # Emit file content as a code block for create_file
+                if name == "create_file":
+                    rel = str(args.get("relative_path", "")).strip()
+                    file_content = str(args.get("content", ""))
+                    if rel and file_content.strip():
+                        self._emit_code_block(rel, file_content)
 
-                            nested_sync = sync_read_result.get("result") if isinstance(sync_read_result, dict) else None
-                            sync_content = ""
-                            if isinstance(nested_sync, dict) and bool(nested_sync.get("ok", False)):
-                                sync_content = str(nested_sync.get("content", ""))
-                                file_read_generation[relative_path] = file_generation.get(relative_path, 0)
+                tool_trace.append({
+                    "iteration": iteration,
+                    "stage": stage_name,
+                    "tool": name,
+                    "arguments": args,
+                    "result": result,
+                })
+                memory.add("tool", json.dumps(result), name=name)
+                executed_count += 1
 
-                            planning_context = "\n".join(f"- {entry}" for entry in planning_entries[-8:]) or "- (none)"
-                            memory.add(
-                                "user",
-                                self._build_edit_sync_prompt(
-                                    relative_path=relative_path,
-                                    planning_context=planning_context,
-                                    full_file_content=sync_content,
-                                ),
-                            )
-                            tool_result = self._deferred_tool_result(
-                                tool_name="create_file",
-                                reason=(
-                                    f"Deferred edit for '{relative_path}' until full file context and planning notes were injected. "
-                                    "Re-issue create_file with synchronized full-file update."
-                                ),
-                            )
-                        else:
-                            tool_result = self._call_mcp_tool(tool_name, arguments)
-                            nested_write = tool_result.get("result") if isinstance(tool_result, dict) else None
-                            if isinstance(nested_write, dict) and bool(nested_write.get("ok", False)) and relative_path:
-                                file_generation[relative_path] = file_generation.get(relative_path, 0) + 1
-                                last_create_file_signature[relative_path] = signature
-                                project_memory.mark_touched(relative_path)
-                                reflection = self._build_diff_reflection_prompt(
-                                    relative_path=relative_path,
-                                    before=previous_content,
-                                    after=content_value,
-                                )
-                                if reflection:
-                                    memory.add("user", reflection)
-                elif tool_name in {"append_to_file", "insert_after_marker", "replace_range"}:
-                    relative_path = str(arguments.get("relative_path", "")).strip()
-                    structured_signature = self._text_signature(
-                        json.dumps({"tool": tool_name, "arguments": arguments}, sort_keys=True, ensure_ascii=False)
-                    )
+                # Track created files
+                if name == "create_file":
+                    rel = str(args.get("relative_path", "")).strip()
+                    nested = result.get("result") if isinstance(result, dict) else None
+                    if rel and isinstance(nested, dict) and nested.get("ok", False):
+                        created_files.add(rel)
+                        self.project_memory.mark_touched(rel)
 
-                    if relative_path and last_structured_edit_signature.get(relative_path) == structured_signature:
-                        tool_result = self._deferred_tool_result(
-                            tool_name=tool_name,
-                            reason=(
-                                f"Skipped redundant structured edit for '{relative_path}' because arguments are identical "
-                                "to the previous successful structured edit."
-                            ),
-                        )
-                    else:
-                        existing_file = self._resolve_workspace_file(relative_path)
-                        needs_sync_read = False
-                        if existing_file is not None and existing_file.exists() and existing_file.is_file():
-                            generation = file_generation.get(relative_path, 0)
-                            read_generation = file_read_generation.get(relative_path, -1)
-                            needs_sync_read = read_generation < generation or read_generation < 0
+            memory.add("assistant", content, tool_calls=tool_calls)
+            self._compact_memory(memory)
 
-                        if needs_sync_read and relative_path:
-                            sync_read_args = {"relative_path": relative_path, "max_bytes": 200000}
-                            sync_read_result = self._call_mcp_tool("read_file", sync_read_args)
-                            project_memory.mark_touched(relative_path)
-                            tool_trace.append(
-                                {
-                                    "iteration": iteration,
-                                    "tool": "read_file",
-                                    "arguments": sync_read_args,
-                                    "result": sync_read_result,
-                                }
-                            )
-                            memory.add("tool", json.dumps(sync_read_result), name="read_file")
+        # --- Run validation at the end (informational only) ---
+        self._run_validation(tool_trace=tool_trace, memory=memory, iteration=iteration + 1)
 
-                            nested_sync = sync_read_result.get("result") if isinstance(sync_read_result, dict) else None
-                            sync_content = ""
-                            if isinstance(nested_sync, dict) and bool(nested_sync.get("ok", False)):
-                                sync_content = str(nested_sync.get("content", ""))
-                                file_read_generation[relative_path] = file_generation.get(relative_path, 0)
-
-                            planning_context = "\n".join(f"- {entry}" for entry in planning_entries[-8:]) or "- (none)"
-                            memory.add(
-                                "user",
-                                self._build_structured_edit_sync_prompt(
-                                    tool_name=tool_name,
-                                    relative_path=relative_path,
-                                    planning_context=planning_context,
-                                    full_file_content=sync_content,
-                                ),
-                            )
-                            tool_result = self._deferred_tool_result(
-                                tool_name=tool_name,
-                                reason=(
-                                    f"Deferred structured edit for '{relative_path}' until full file context was refreshed. "
-                                    "Re-issue with corrected line ranges/markers based on current file contents."
-                                ),
-                            )
-                        else:
-                            tool_result = self._call_mcp_tool(tool_name, arguments)
-                            nested_edit = tool_result.get("result") if isinstance(tool_result, dict) else None
-                            if isinstance(nested_edit, dict) and bool(nested_edit.get("ok", False)) and relative_path:
-                                file_generation[relative_path] = file_generation.get(relative_path, 0) + 1
-                                last_structured_edit_signature[relative_path] = structured_signature
-                                project_memory.mark_touched(relative_path)
-                else:
-                    tool_result = self._call_mcp_tool(tool_name, arguments)
-
-                if tool_name == "create_file":
-                    relative_path = str(arguments.get("relative_path", "")).strip()
-                    nested_create = tool_result.get("result") if isinstance(tool_result, dict) else None
-                    write_ok = bool(
-                        isinstance(nested_create, dict)
-                        and nested_create.get("ok", False)
-                        and not nested_create.get("deferred", False)
-                    )
-                    if relative_path and write_ok:
-                        changed_since_validation.add(relative_path)
-                        changed_since_tests.add(relative_path)
-                        iteration_changed_files += 1
-                        edited_files_this_iteration.add(relative_path)
-                        iteration_had_non_edit_progress = True
-                        substantive_edit_count += 1
-                if tool_name in {"append_to_file", "insert_after_marker", "replace_range"}:
-                    relative_path = str(arguments.get("relative_path", "")).strip()
-                    nested_edit = tool_result.get("result") if isinstance(tool_result, dict) else None
-                    edit_ok = bool(
-                        isinstance(nested_edit, dict)
-                        and nested_edit.get("ok", False)
-                        and not nested_edit.get("deferred", False)
-                    )
-                    if relative_path and edit_ok:
-                        changed_since_validation.add(relative_path)
-                        changed_since_tests.add(relative_path)
-                        iteration_changed_files += 1
-                        edited_files_this_iteration.add(relative_path)
-                        project_memory.mark_touched(relative_path)
-                        iteration_had_non_edit_progress = True
-                        substantive_edit_count += 1
-                if tool_name == "scaffold_web_app":
-                    nested_scaffold = tool_result.get("result") if isinstance(tool_result, dict) else None
-                    scaffold_ok = bool(isinstance(nested_scaffold, dict) and nested_scaffold.get("ok", False))
-                    if scaffold_ok and isinstance(nested_scaffold, dict):
-                        created = nested_scaffold.get("created_or_verified", [])
-                        if isinstance(created, list):
-                            for item in created:
-                                path_text = str(item).strip()
-                                if not path_text:
-                                    continue
-                                normalized_rel = self._normalize_workspace_relative_path(path_text)
-                                if normalized_rel and normalized_rel != ".":
-                                    changed_since_validation.add(normalized_rel)
-                                    changed_since_tests.add(normalized_rel)
-                                    edited_files_this_iteration.add(normalized_rel)
-                                    project_memory.mark_touched(normalized_rel)
-                        iteration_changed_files += 1
-                        iteration_had_non_edit_progress = True
-                if tool_name == "read_file":
-                    relative_path = str(arguments.get("relative_path", "")).strip()
-                    if relative_path:
-                        file_read_generation[relative_path] = file_generation.get(relative_path, 0)
-                        project_memory.mark_touched(relative_path)
-                        iteration_had_non_edit_progress = True
-                if tool_name == "plan_web_build":
-                    nested = tool_result.get("result") if isinstance(tool_result, dict) else None
-                    if isinstance(nested, dict) and nested.get("ok", False):
-                        phase_plan_ready = True
-                        iteration_had_non_edit_progress = True
-                        phases = nested.get("phases", [])
-                        if isinstance(phases, list):
-                            development_phases = [str(item) for item in phases if str(item).strip()] or development_phases
-                        plan_reason = self._build_plan_result_reason(arguments=arguments, result=nested)
-                        if plan_reason:
-                            planning_entries.append(plan_reason)
-                            print(
-                                f"[response:agent] {json.dumps({'content': json.dumps({'type': 'reason', 'text': plan_reason}, ensure_ascii=False)}, ensure_ascii=False)}",
-                                file=sys.stderr,
-                                flush=True,
-                            )
-                if tool_name == "list_directory":
-                    nested_list = tool_result.get("result") if isinstance(tool_result, dict) else None
-                    if isinstance(nested_list, dict) and nested_list.get("ok", False):
-                        iteration_had_non_edit_progress = True
-
-                iteration_tool_names.append(tool_name)
-                tool_trace.append(
-                    {
-                        "iteration": iteration,
-                        "tool": tool_name,
-                        "arguments": arguments,
-                        "result": tool_result,
-                    }
-                )
-                memory.add("tool", json.dumps(tool_result), name=tool_name)
-                project_memory.write_event(
-                    stage="tool_result",
-                    payload={
-                        "iteration": iteration,
-                        "tool": tool_name,
-                        "arguments": arguments,
-                        "ok": bool(isinstance(tool_result, dict) and tool_result.get("ok", False)),
-                    },
-                )
-
-                tool_feedback = self._extract_tool_feedback(tool_name=tool_name, tool_result=tool_result)
-                if tool_feedback is not None:
-                    iteration_had_tool_error = True
-                    iteration_feedback.append(tool_feedback)
-
-            if iteration_feedback:
-                feedback_text = self._build_tool_feedback_prompt(iteration_feedback)
-                memory.add("user", feedback_text)
-                repair_events.append(
-                    {
-                        "iteration": iteration,
-                        "tool_names": iteration_tool_names,
-                        "tool_feedback": iteration_feedback,
-                    }
-                )
-
-            if not iteration_had_tool_error:
-                memory.add(
-                    "user",
-                    (
-                        "Proceed to the next phase step. "
-                        "Only run validate_web_app and run_unit_tests after meaningful milestones, not after every file edit. "
-                        "If complete, respond with 'DONE:' and summary."
-                    ),
-                )
-
-            if iteration_changed_files == 0 and not iteration_had_non_edit_progress:
-                no_progress_iterations += 1
-            else:
-                no_progress_iterations = 0
-
-            # Track tool-call signature repetition across iterations
-            iteration_sig = json.dumps(
-                sorted(iteration_tool_names),
-                sort_keys=True,
-            )
-            recent_tool_call_signatures.append(iteration_sig)
-            if len(recent_tool_call_signatures) > max_repeated_signatures:
-                recent_tool_call_signatures = recent_tool_call_signatures[-max_repeated_signatures:]
-            if (
-                len(recent_tool_call_signatures) >= max_repeated_signatures
-                and len(set(recent_tool_call_signatures)) == 1
-                and iteration_changed_files == 0
-            ):
-                stop_message = (
-                    "STOP: Identical tool-call pattern repeated across multiple iterations with no file changes. "
-                    "The agent appears stuck in a loop; stopping to avoid wasting resources."
-                )
-                return {
-                    "ok": False,
-                    "status": "stopped_no_progress",
-                    "iterations": iteration,
-                    "final_message": stop_message,
-                    "tool_trace": tool_trace,
-                    "selection_trace": selection_trace,
-                    "repair_trace": repair_events,
-                }
-
-            if no_progress_iterations >= max_no_progress_iterations:
-                stop_message = (
-                    "STOP: No meaningful file-change progress after repeated attempts. "
-                    "Validation/testing appears blocked or cyclical; stopping to avoid infinite loop."
-                )
-                return {
-                    "ok": False,
-                    "status": "stopped_no_progress",
-                    "iterations": iteration,
-                    "final_message": stop_message,
-                    "tool_trace": tool_trace,
-                    "selection_trace": selection_trace,
-                    "repair_trace": repair_events,
-                }
-
-    def _is_done_message(self, content: str) -> bool:
-        normalized = content.strip().upper()
-        return normalized.startswith("DONE:")
-
-    def _is_stop_message(self, content: str) -> bool:
-        normalized = content.strip().upper()
-        return normalized.startswith("STOP:")
-
-    def _looks_like_completion_without_done(self, content: str) -> bool:
-        normalized = content.strip()
-        if not normalized:
-            return False
-        upper = normalized.upper()
-        if upper.startswith("DONE:") or upper.startswith("STOP:"):
-            return False
-
-        lowered = normalized.lower()
-        completion_markers = [
-            "task has been completed",
-            "task is complete",
-            "project is complete",
-            "project is now complete",
-            "no further actions are necessary",
-            "no further changes are required",
-            "all unit tests have passed",
-            "fully developed and tested",
-            "all checks have passed",
-        ]
-        score = sum(1 for marker in completion_markers if marker in lowered)
-        return score >= 1
-
-    def _claims_success_without_evidence(self, *, content: str, last_validation_ok: bool, tests_runs: int) -> bool:
-        lowered = content.strip().lower()
-        if not lowered:
-            return False
-        mentions_validation = any(
-            token in lowered
-            for token in [
-                "validated",
-                "validation passed",
-                "all checks passed",
-                "tests have passed",
-                "unit tests passed",
-            ]
-        )
-        if not mentions_validation:
-            return False
-        has_evidence = last_validation_ok and tests_runs > 0
-        return not has_evidence
-
-    def _extract_tool_feedback(self, *, tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any] | None:
-        if tool_name not in {
-            "create_file",
-            "append_to_file",
-            "insert_after_marker",
-            "replace_range",
-            "read_file",
-            "list_directory",
-            "scaffold_web_app",
-            "validate_web_app",
-            "run_unit_tests",
-            "plan_web_build",
-        }:
-            return None
-
-        nested = tool_result.get("result") if isinstance(tool_result, dict) else None
-        if not isinstance(nested, dict):
-            return {
-                "tool": tool_name,
-                "error": "Invalid tool response format",
-                "stdout": "",
-                "stderr": json.dumps(tool_result),
-            }
-
-        ok = bool(nested.get("ok", False))
-        stderr = str(nested.get("stderr", ""))
-        stdout = str(nested.get("stdout", ""))
-        if ok:
-            return None
-
-        error_payload = nested.get("error")
-        error_message = ""
-        if isinstance(error_payload, dict):
-            error_message = str(error_payload.get("message", ""))
-        elif isinstance(error_payload, str):
-            error_message = error_payload
+        # --- Generate summary and return ---
+        summary = self._generate_summary(task=task, tool_trace=tool_trace)
 
         return {
-            "tool": tool_name,
-            "error": error_message,
-            "stdout": stdout,
-            "stderr": stderr,
+            "ok": True,
+            "status": "completed",
+            "iterations": iteration,
+            "final_message": self._as_chat_envelope(summary),
+            "tool_trace": tool_trace,
+            "selection_trace": [],
+            "repair_trace": [],
         }
 
-    def _build_tool_feedback_prompt(self, feedback_items: list[dict[str, Any]]) -> str:
-        lines = [
-            "Tool diagnostics were returned. Repair the implementation before continuing:",
-        ]
-        structured_errors: list[dict[str, Any]] = []
-        for item in feedback_items:
-            tool = str(item.get("tool", "unknown"))
-            error = str(item.get("error", "")).strip()
-            stdout = str(item.get("stdout", "")).strip()
-            stderr = str(item.get("stderr", "")).strip()
+    # ------------------------------------------------------------------
+    # Stage prompt builder
+    # ------------------------------------------------------------------
 
-            lines.append(f"- tool: {tool}")
-            if error:
-                lines.append(f"  error: {error}")
-            if stderr:
-                lines.append(f"  stderr: {stderr[:3000]}")
-            if stdout:
-                lines.append(f"  stdout: {stdout[:1000]}")
+    def _build_stage_prompt(
+        self,
+        *,
+        stage_name: str,
+        stage_desc: str,
+        task: str,
+        created_files: set[str],
+        workspace_state: dict[str, Any],
+    ) -> str:
+        is_empty = workspace_state["is_empty"]
+        lines = [f"=== STAGE: {stage_name} ===", stage_desc, ""]
 
-            structured_errors.extend(self._parse_structured_errors(tool=tool, text=stderr or stdout or error))
+        if created_files:
+            lines.append("Known files: " + ", ".join(sorted(created_files)))
+            lines.append("")
 
-        if structured_errors:
-            lines.append("Structured errors (normalized JSON):")
-            lines.append(json.dumps(structured_errors[:30], ensure_ascii=False))
+        # ------ PLAN stage ------
+        if stage_name == "plan":
+            if is_empty:
+                lines.extend(self._build_new_project_plan_prompt(task))
+            else:
+                lines.extend(self._build_existing_project_plan_prompt(task, workspace_state))
 
-        lines.append("Apply a fix, run the appropriate tools again, and only finish with 'DONE:' when verified.")
+        # ------ CODE stage ------
+        elif stage_name == "code":
+            if is_empty:
+                lines.extend(self._build_new_project_code_prompt(task, created_files))
+            else:
+                lines.extend(self._build_existing_project_code_prompt(task, created_files, workspace_state))
+
         return "\n".join(lines)
 
-    def _parse_structured_errors(self, *, tool: str, text: str) -> list[dict[str, Any]]:
-        if not text.strip():
-            return []
+    def _build_new_project_plan_prompt(self, task: str) -> list[str]:
+        """Build a comprehensive planning prompt for a fresh/empty project."""
+        # Inject semantic file context from project memory
+        file_context = self._get_relevant_file_context(task)
+        lines: list[str] = []
+        if file_context:
+            lines.extend([
+                "=== WORKSPACE FILE CONTEXT ===",
+                file_context,
+                "=== END WORKSPACE FILE CONTEXT ===",
+                "",
+            ])
 
-        items: list[dict[str, Any]] = []
-        pattern = re.compile(r"(?P<file>[^\s:]+):( ?(?P<line>\d+))?(:(?P<col>\d+))?\s*(?P<msg>.+)")
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            match = pattern.match(line)
-            if match:
-                file_name = str(match.group("file") or "")
-                line_no = match.group("line")
-                items.append(
-                    {
-                        "tool": tool,
-                        "file": file_name,
-                        "line": int(line_no) if line_no and line_no.isdigit() else None,
-                        "error_type": "diagnostic",
-                        "message": str(match.group("msg") or "").strip(),
-                    }
-                )
-            else:
-                items.append(
-                    {
-                        "tool": tool,
-                        "file": "",
-                        "line": None,
-                        "error_type": "diagnostic",
-                        "message": line[:500],
-                    }
-                )
-        return items
+        lines.extend([
+            f"Original request: {task}",
+            "",
+            "This is a NEW, EMPTY project. You must plan everything from scratch.",
+            "",
+            "Create a COMPREHENSIVE and DETAILED plan covering ALL of the following:",
+            "",
+            "1. FEATURES — List every feature the app needs. Be specific:",
+            "   - What does the user see on load?",
+            "   - What interactions are available (forms, buttons, lists)?",
+            "   - What data does the app manage?",
+            "   - What happens on each user action?",
+            "",
+            "2. FILE STRUCTURE — List every file to create:",
+            "   - index.html — the main HTML file",
+            "   - styles.css — all styling",
+            "   - script.js — all JavaScript logic",
+            "   - Any additional files if needed",
+            "",
+            "3. HTML PLAN — For index.html, describe:",
+            "   - Full page structure (header, main, sections, footer)",
+            "   - EVERY element with its tag, id attribute, and purpose",
+            "     Example: <form id=\"noteForm\"> — form for creating new notes",
+            "     Example: <input id=\"noteInput\" type=\"text\"> — text input for note content",
+            "     Example: <ul id=\"notesList\"> — list container for all notes",
+            "   - How elements are nested and grouped",
+            "   - Don't add any copyright or trademark symbols, all this projects are just for fun",
+            "   - Links to styles.css and script.js",
+            "",
+            "4. CSS PLAN — For styles.css, describe:",
+            "   - Layout approach (flexbox, grid, etc.)",
+            "   - Color scheme, fonts",
+            "   - Styling for each HTML element/ID listed above",
+            "   - Responsive breakpoints",
+            "   - Hover states, transitions, animations",
+            "   -  Spacing: no elements should touching each other directly (both vertical and horizontal)",
+            "   - Default should be fun and colorful design unless tone is specified by user prompt.",
+            "",
+            "5. JAVASCRIPT PLAN — For script.js, describe:",
+            "   - Data structures (arrays, objects) used to store app state",
+            "   - EVERY function name, its parameters, return value, and what it does",
+            "     Example: addNote(text) — creates a note object, adds to array, re-renders list",
+            "     Example: deleteNote(id) — removes note from array by id, re-renders",
+            "   - DOM references — which element IDs each function uses",
+            "   - Event listeners — which elements trigger which functions",
+            "   - Data persistence strategy (localStorage, etc.)",
+            "   - Module exports for testability",
+            "",
+            "6. CONNECTIONS — Describe how files reference each other:",
+            "   - HTML -> CSS: which classes/IDs CSS targets",
+            "   - HTML -> JS: which IDs JS queries with getElementById/querySelector",
+            "   - JS -> HTML: which elements JS creates or modifies dynamically",
+            "",
+            "Be THOROUGH. The coding stage will rely entirely on this plan.",
+            "Use plan_web_build to register the plan when done.",
+            "Do NOT create any files yet.",
+        ])
+        return lines
 
-    def _select_active_phase(self, *, iteration: int, plan: dict[str, Any], development_phases: list[str]) -> str:
-        active_phase = str(plan.get("active_phase", "")).strip()
-        if active_phase:
-            return active_phase
+    def _build_existing_project_plan_prompt(
+        self, task: str, workspace_state: dict[str, Any],
+    ) -> list[str]:
+        """Build a planning prompt for an existing/populated project."""
+        lines: list[str] = []
 
-        if development_phases:
-            index = min(max(iteration - 1, 0), len(development_phases) - 1)
-            return development_phases[index]
+        lines.extend([
+            f"Original request: {task}",
+            "",
+            "This is an EXISTING project with files already in place.",
+            "The existing file contents have been provided above in the conversation.",
+            "",
+            "Your job: study the existing code, understand the current state,",
+            "then plan what changes or additions are needed.",
+            "",
+            "Create a DETAILED plan covering:",
+            "",
+            "1. CURRENT STATE ANALYSIS:",
+            "   - What does the app currently do?",
+            "   - What files exist and what is in them?",
+            "   - What is working, what is missing, what is broken?",
+            "",
+            "2. REQUIRED CHANGES — For each file that needs modification:",
+            "   - File name",
+            "   - What specifically needs to change",
+            "   - New elements, functions, or styles to add",
+            "   - Existing code to modify or remove",
+            "",
+            "3. NEW FILES — If any new files are needed:",
+            "   - File name and purpose",
+            "   - Complete description of contents",
+            "",
+            "4. CONNECTIONS — How changes affect other files:",
+            "   - If adding HTML elements -> what CSS and JS needs updating?",
+            "   - If adding JS functions -> what HTML IDs do they reference?",
+            "   - If modifying CSS -> which HTML elements are affected?",
+            "",
+            "5. ELEMENT IDS AND REFERENCES:",
+            "   - List ALL element IDs (existing + new) after changes",
+            "   - Map each ID to the JS functions that use it",
+            "   - Map each ID to the CSS rules that style it",
+            "",
+            "Be THOROUGH. The coding stage will rewrite each file based on this plan.",
+            "Remember: every file you write in the code stage must be COMPLETE",
+            "(not just the changed parts).",
+            "Use plan_web_build to register the plan when done.",
+            "Do NOT create any files yet.",
+        ])
+        return lines
 
-        return f"Iteration {iteration}"
+    def _build_new_project_code_prompt(
+        self, task: str, created_files: set[str],
+    ) -> list[str]:
+        """Build the coding prompt for a new project."""
+        lines: list[str] = [
+            f"Task: {task}",
+            "",
+            "Now write ALL files based on your plan above.",
+            "Use create_file for EACH file. Write COMPLETE file contents.",
+            "",
+            "You MUST create all files in this single pass:",
+            "- index.html — complete HTML with all elements, IDs, links to CSS/JS",
+            "- styles.css — complete CSS targeting the exact IDs/elements from your HTML",
+            "- script.js — complete JS referencing the exact IDs from your HTML",
+            "- Any additional files described in your plan",
+            "",
+            "CRITICAL REQUIREMENTS:",
+            "- Every interactive HTML element MUST have a unique, descriptive id",
+            "- CSS must target IDs/classes that actually exist in your HTML",
+            "- JS must use getElementById/querySelector with IDs from your HTML",
+            "- Include <link rel=\"stylesheet\" href=\"styles.css\"> in HTML <head>",
+            "- Include <script src=\"script.js\"></script> before </body>",
+            "- JS: export pure logic functions via module.exports for testability",
+            "- Write ALL planned features — do not skip or simplify",
+            "",
+            "Call create_file once per file with the FULL contents.",
+        ]
+        return lines
+
+    def _build_existing_project_code_prompt(
+        self,
+        task: str,
+        created_files: set[str],
+        workspace_state: dict[str, Any],
+    ) -> list[str]:
+        """Build the coding prompt for an existing project."""
+        # Inject current file contents so the model has full context
+        file_snippets = self._read_created_files(
+            created_files, extensions={".html", ".css", ".js", ".json"},
+        )
+
+        lines: list[str] = [
+            f"Task: {task}",
+            "",
+        ]
+
+        if file_snippets:
+            lines.extend([
+                "=== CURRENT FILE CONTENTS (for reference) ===",
+                file_snippets,
+                "=== END FILE CONTENTS ===",
+                "",
+            ])
+
+        lines.extend([
+            "Now write ALL files that need creating or updating based on your plan.",
+            "Use create_file for EACH file. Write COMPLETE file contents.",
+            "",
+            "IMPORTANT:",
+            "- When modifying an existing file, write the ENTIRE file (not just changes).",
+            "- Include all existing working code plus your modifications.",
+            "- Maintain all existing element IDs, classes, and function names",
+            "  unless your plan specifically calls for changing them.",
+            "- CSS must target IDs/classes that actually exist in the HTML.",
+            "- JS must reference IDs that actually exist in the HTML.",
+            "- Include proper stylesheet and script links in HTML.",
+            "",
+            "Call create_file once per file with the FULL contents.",
+        ])
+        return lines
+
+    # ------------------------------------------------------------------
+    # Validation (informational — runs after code stage)
+    # ------------------------------------------------------------------
+
+    def _run_validation(
+        self,
+        *,
+        tool_trace: list[dict[str, Any]],
+        memory: SessionMemory,
+        iteration: int,
+    ) -> None:
+        """Run validate_web_app to check the output. Informational only."""
+        print("[status:agent] running validation...", file=sys.stderr, flush=True)
+        val_args: dict[str, Any] = {"app_dir": "."}
+        self._emit_tool_call_event(tool_name="validate_web_app", arguments=val_args)
+        val_result = self._call_mcp_tool("validate_web_app", val_args)
+        self._emit_terminal_logs("validate_web_app", val_result)
+        tool_trace.append({
+            "iteration": iteration,
+            "stage": "validate",
+            "tool": "validate_web_app",
+            "arguments": val_args,
+            "result": val_result,
+        })
+        memory.add("tool", json.dumps(val_result), name="validate_web_app")
+
+        val_nested = val_result.get("result") if isinstance(val_result, dict) else None
+        val_ok = bool(isinstance(val_nested, dict) and val_nested.get("ok", False))
+        if val_ok:
+            self._emit_reasoning("validate", "Validation passed — all files look good.")
+        else:
+            details = self._extract_error_details(val_result)
+            self._emit_reasoning("validate", f"Validation found issues:\n{details}")
+
+    # ------------------------------------------------------------------
+    # Tool helpers
+    # ------------------------------------------------------------------
+
+    def _get_stage_tools(self, stage_name: str) -> list[dict[str, Any]]:
+        """Return tool definitions allowed for a given stage."""
+        allowed_names = STAGE_TOOLS.get(stage_name, [])
+        tools: list[dict[str, Any]] = []
+        for name in allowed_names:
+            if name in self._tools_by_name:
+                tools.append(self._tools_by_name[name])
+        return tools or self.tools[:3]
+
+    def _get_pruned_tools(self, *, query: str, stage_name: str) -> list[dict[str, Any]]:
+        """Return the stage-required tools.
+
+        Tool pruning logs relevance scores for debugging,
+        but the final tool list is always the static STAGE_TOOLS mapping.
+        """
+        stage_tools = self._get_stage_tools(stage_name)
+        tool_names = [self._tool_name(t) for t in stage_tools]
+
+        # Log pruning info for debugging (non-blocking)
+        try:
+            combined_query = query
+            planner_query = getattr(self, "_current_retrieval_query", "")
+            if planner_query and planner_query != query:
+                combined_query = f"{query} | {planner_query}"
+            self.tool_pruner.retrieve_candidates(
+                query=combined_query,
+                tools=self.tools,
+                top_n=self.candidate_pool_size,
+            )
+        except Exception:
+            pass
+
+        self._emit_reasoning_raw(
+            "reranker",
+            f"Tools for {stage_name}: " + ", ".join(sorted(tool_names)),
+        )
+        return stage_tools
+
+    @staticmethod
+    def _tool_name(tool: dict[str, Any]) -> str:
+        """Extract tool function name from a tool definition dict."""
+        func = tool.get("function", {})
+        return str(func.get("name", "")) if isinstance(func, dict) else ""
 
     def _normalize_tool_call(self, call: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Normalize tool call: resolve aliases, fix argument names."""
         tool_name = str(call.get("name", "")).strip()
         arguments = call.get("arguments", {})
         if not isinstance(arguments, dict):
             arguments = {}
 
+        # Resolve aliases
         canonical = TOOL_NAME_ALIASES.get(tool_name, tool_name)
+
+        # Fuzzy name matching
         if canonical == tool_name:
             lowered = canonical.lower()
             if "edit" in lowered or "write" in lowered or "save" in lowered:
                 canonical = "create_file"
-            elif "append" in lowered:
-                canonical = "append_to_file"
-            elif "insert" in lowered:
-                canonical = "insert_after_marker"
-            elif "replace" in lowered and "range" in lowered:
-                canonical = "replace_range"
             elif "read" in lowered or "open" in lowered or "view" in lowered:
                 canonical = "read_file"
             elif "list" in lowered or lowered == "ls":
                 canonical = "list_directory"
-            elif "test" in lowered:
-                canonical = "run_unit_tests"
             elif "valid" in lowered or "check" in lowered:
                 canonical = "validate_web_app"
-            elif "scaffold" in lowered or "bootstrap" in lowered:
-                canonical = "scaffold_web_app"
             elif "plan" in lowered:
                 canonical = "plan_web_build"
 
+        # Fix argument names
         if canonical == "create_file":
             if "file_path" in arguments and "relative_path" not in arguments:
                 arguments["relative_path"] = arguments["file_path"]
+            rel = arguments.get("relative_path")
+            if isinstance(rel, str):
+                arguments["relative_path"] = self._normalize_path(rel)
             arguments.setdefault("overwrite", True)
-        if canonical in {"append_to_file", "insert_after_marker", "replace_range"}:
+
+        if canonical == "read_file":
             if "file_path" in arguments and "relative_path" not in arguments:
                 arguments["relative_path"] = arguments["file_path"]
-        if canonical == "replace_range" and "replacement_text" in arguments and "content" not in arguments:
-            arguments["content"] = arguments["replacement_text"]
-        if canonical == "read_file" and "file_path" in arguments and "relative_path" not in arguments:
-            arguments["relative_path"] = arguments["file_path"]
+            rel = arguments.get("relative_path")
+            if isinstance(rel, str):
+                arguments["relative_path"] = self._normalize_path(rel)
+
         if canonical == "list_directory":
-            rel_dir = arguments.get("relative_path")
-            if isinstance(rel_dir, str):
-                normalized = self._normalize_workspace_relative_path(rel_dir)
-                if normalized:
-                    arguments["relative_path"] = normalized
+            rel = arguments.get("relative_path")
+            if isinstance(rel, str):
+                arguments["relative_path"] = self._normalize_path(rel)
             elif "relative_path" not in arguments:
                 arguments["relative_path"] = "."
+
         if canonical == "validate_web_app":
             app_dir = arguments.get("app_dir")
             if isinstance(app_dir, str):
-                normalized = self._normalize_workspace_relative_path(app_dir)
-                if normalized:
-                    arguments["app_dir"] = normalized
-        if canonical == "scaffold_web_app":
-            app_dir = arguments.get("app_dir")
-            if isinstance(app_dir, str):
-                normalized = self._normalize_workspace_relative_path(app_dir)
-                if normalized:
-                    arguments["app_dir"] = normalized
-        if canonical == "run_unit_tests":
-            test_file = arguments.get("test_file")
-            if isinstance(test_file, str):
-                normalized = self._normalize_workspace_relative_path(test_file)
-                if normalized:
-                    arguments["test_file"] = normalized
-        if canonical in {"append_to_file", "insert_after_marker", "replace_range"}:
-            relative_path = arguments.get("relative_path")
-            if isinstance(relative_path, str):
-                normalized = self._normalize_workspace_relative_path(relative_path)
-                if normalized:
-                    arguments["relative_path"] = normalized
+                arguments["app_dir"] = self._normalize_path(app_dir)
+
         return canonical, arguments
 
-    def _normalize_workspace_relative_path(self, raw_path: str) -> str:
-        candidate = raw_path.strip()
-        if not candidate:
-            return candidate
-        path_obj = Path(candidate)
-        if not path_obj.is_absolute():
-            return candidate
-
-        resolved = path_obj.expanduser().resolve()
-        try:
-            relative = resolved.relative_to(self.workspace_root_path)
-        except ValueError:
-            return "."
-        return str(relative) if str(relative) else "."
-
-    def _merge_tools_by_name(
-        self,
-        selected_tools: list[dict[str, Any]],
-        *,
-        required_names: set[str],
-    ) -> list[dict[str, Any]]:
-        merged: list[dict[str, Any]] = []
-        seen_names: set[str] = set()
-
-        for tool in selected_tools:
-            name = str(tool.get("function", {}).get("name", ""))
-            if not name or name in seen_names:
-                continue
-            seen_names.add(name)
-            merged.append(tool)
-
-        for tool in self.tools:
-            name = str(tool.get("function", {}).get("name", ""))
-            if not name or name in seen_names:
-                continue
-            if name in required_names:
-                seen_names.add(name)
-                merged.append(tool)
-
-        return merged
-
-    def _ensure_required_tools(
-        self,
-        *,
-        selected_tools: list[dict[str, Any]],
-        phase_plan_ready: bool,
-        workspace_is_empty: bool,
-    ) -> list[dict[str, Any]]:
-        required_names: set[str] = {
-            "list_directory",
-            "read_file",
-            "create_file",
-            "append_to_file",
-            "insert_after_marker",
-            "replace_range",
-        }
-        if not phase_plan_ready:
-            required_names.add("plan_web_build")
-            if workspace_is_empty:
-                required_names.add("scaffold_web_app")
-
-        merged = self._merge_tools_by_name(selected_tools, required_names=required_names)
-        limit = max(self.top_k_tools, len(required_names))
-        return merged[: max(1, min(limit, len(merged)))]
-
-    def _should_run_validation(self, *, changed_since_validation: set[str], validation_runs: int) -> bool:
-        if validation_runs == 0:
-            has_html = any(path.lower().endswith(".html") for path in changed_since_validation)
-            has_css = any(path.lower().endswith(".css") for path in changed_since_validation)
-            has_js = any(path.lower().endswith(".js") for path in changed_since_validation)
-            return has_html and has_css and has_js
-        return len(changed_since_validation) >= 1
-
-    def _should_run_tests(
-        self,
-        *,
-        changed_since_tests: set[str],
-        tests_runs: int,
-        last_validation_ok: bool,
-        validation_ever_passed: bool = False,
-    ) -> bool:
-        if not last_validation_ok and not validation_ever_passed:
-            return False
-        has_test_file_change = any(re.search(r"(test|spec)s?\.js$", path.lower()) for path in changed_since_tests)
-        if tests_runs == 0:
-            return has_test_file_change and len(changed_since_tests) >= 2
-        return len(changed_since_tests) >= 1
-
-    def _deferred_tool_result(self, *, tool_name: str, reason: str) -> dict[str, Any]:
-        return {
-            "ok": True,
-            "result": {
-                "ok": True,
-                "deferred": True,
-                "stdout": f"{tool_name} deferred: {reason}",
-                "stderr": "",
-            },
-        }
-
-    def _completion_gaps(self, *, task: str, tool_trace: list[dict[str, Any]], iteration: int) -> list[str]:
-        gaps: list[str] = []
-        min_iterations = int(os.environ.get("ORCHESTRATOR_MIN_BUILD_ITERATIONS", "4"))
-        if iteration < min_iterations:
-            gaps.append(f"run more phased steps (minimum {min_iterations}, current {iteration})")
-
-        created_files: list[str] = []
-        validated_ok = False
-        tests_ok_files: list[str] = []
-
-        for item in tool_trace:
-            if not isinstance(item, dict):
-                continue
-            tool_name = str(item.get("tool", ""))
-            arguments = item.get("arguments", {})
-            result = item.get("result", {})
-            nested = result.get("result") if isinstance(result, dict) else None
-            nested_ok = bool(nested.get("ok", False)) if isinstance(nested, dict) else False
-
-            if tool_name == "create_file" and isinstance(arguments, dict):
-                rel = str(arguments.get("relative_path", "")).strip()
-                if rel:
-                    created_files.append(rel)
-
-            if tool_name == "validate_web_app" and nested_ok:
-                is_deferred = bool(isinstance(nested, dict) and nested.get("deferred", False))
-                if not is_deferred:
-                    validated_ok = True
-
-            if tool_name == "run_unit_tests" and nested_ok and isinstance(arguments, dict):
-                test_file = str(arguments.get("test_file", "")).strip().lower()
-                if test_file:
-                    tests_ok_files.append(test_file)
-
-        lowered = [path.lower() for path in created_files]
-        has_html = any(path.endswith(".html") for path in lowered)
-        has_css = any(path.endswith(".css") for path in lowered)
-        has_js = any(path.endswith(".js") for path in lowered)
-        has_test_file = any(re.search(r"(test|spec)s?\.js$", path) for path in lowered)
-
-        if not has_html:
-            gaps.append("create/update HTML UI files")
-        if not has_css:
-            gaps.append("create/update CSS styling files")
-        if not has_js:
-            gaps.append("create/update JavaScript behavior files")
-        if not has_test_file:
-            gaps.append("create a real unit test file (e.g., tests.js or *.test.js)")
-        if not validated_ok:
-            gaps.append("run validate_web_app successfully")
-
-        has_real_test_run = any(re.search(r"(test|spec)s?\.js$", path) for path in tests_ok_files)
-        if not has_real_test_run:
-            gaps.append("run run_unit_tests successfully on a real test file")
-
-        if "note" in task.lower():
-            requested_keywords = ["create", "edit", "delete"]
-            detected_keywords = {key: False for key in requested_keywords}
-            for item in tool_trace:
-                tool_name = str(item.get("tool", ""))
-                if tool_name not in {"create_file", "append_to_file", "insert_after_marker", "replace_range"}:
-                    continue
-                arguments = item.get("arguments", {})
-                if not isinstance(arguments, dict):
-                    continue
-                content = str(arguments.get("content", arguments.get("replacement_text", ""))).lower()
-                for key in requested_keywords:
-                    if key in content:
-                        detected_keywords[key] = True
-            for key, present in detected_keywords.items():
-                if not present:
-                    gaps.append(f"implement note {key} behavior in app code")
-
-        return gaps
-
-    def _recover_tool_calls(
-        self,
-        *,
-        memory: SessionMemory,
-        selected_tools: list[dict[str, Any]],
-    ) -> tuple[str, list[dict[str, Any]]]:
-        available_names = [
-            str(item.get("function", {}).get("name", ""))
-            for item in selected_tools
-            if isinstance(item, dict)
-        ]
-        available_text = ", ".join(name for name in available_names if name)
-        recovery_prompt = (
-            "You returned analysis without a tool call. "
-            "If more work is needed, respond with exactly one tool call using available tools now. "
-            f"Available tools this turn: {available_text}. "
-            "If and only if everything is already complete, respond with 'DONE:' and a short summary. "
-            "Do not claim completion without the exact DONE prefix. "
-            "If execution is persistently blocked by environment/tooling after repeated retries, respond with 'STOP:' and a short reason."
-        )
-
-        recovery_messages = [*memory.messages, {"role": "user", "content": recovery_prompt}]
-        print("[status:recovery] calling model for recovery...", file=sys.stderr, flush=True)
-        recovery_tools = self._merge_tools_by_name(
-            selected_tools,
-            required_names={
-                "list_directory",
-                "read_file",
-                "create_file",
-                "append_to_file",
-                "insert_after_marker",
-                "replace_range",
-                "scaffold_web_app",
-                "plan_web_build",
-                "validate_web_app",
-                "run_unit_tests",
-            },
-        )
-        response = self.ollama_client.chat(
-            model=self.model_name,
-            messages=recovery_messages,
-            tools=recovery_tools,
-            stream=False,
-            num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 32768),
-            num_predict=_env_int("ORCHESTRATOR_AGENT_NUM_PREDICT", 8192),
-        )
-        assistant_message = self.ollama_client.extract_assistant_message(response)
-        content = str(assistant_message.get("content", ""))
-        tool_calls = self.ollama_client.extract_tool_calls(assistant_message)
-        if content.strip():
-            print(
-                f"[response:recovery] {json.dumps({'content': content}, ensure_ascii=False)}",
-                file=sys.stderr,
-                flush=True,
-            )
-        tool_calls = self._deduplicate_tool_calls(tool_calls)
-        return content, tool_calls
-
     def _call_mcp_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Call an MCP tool via subprocess."""
         request = {
             "action": "call_tool",
             "tool": tool_name,
@@ -1386,232 +834,14 @@ class LoopController:
         except json.JSONDecodeError:
             parsed = {
                 "ok": False,
-                "error": {
-                    "type": "InvalidJSON",
-                    "message": output,
-                },
+                "error": {"type": "InvalidJSON", "message": output[:500]},
             }
         return parsed
 
-    def _extract_reason_entries(self, content: str) -> list[str]:
-        entries: list[str] = []
-        if not content.strip():
-            return entries
-
-        payloads: list[Any] = []
-        stripped = content.strip()
-        try:
-            payloads.append(json.loads(stripped))
-        except json.JSONDecodeError:
-            pass
-
-        marker = "```"
-        cursor = 0
-        while True:
-            start = content.find(marker, cursor)
-            if start == -1:
-                break
-            end = content.find(marker, start + len(marker))
-            if end == -1:
-                break
-            block = content[start + len(marker) : end].strip()
-            if block.lower().startswith("json"):
-                block = block[4:].strip()
-            if block:
-                try:
-                    payloads.append(json.loads(block))
-                except json.JSONDecodeError:
-                    pass
-            cursor = end + len(marker)
-
-        def collect(payload: Any) -> None:
-            if isinstance(payload, list):
-                for item in payload:
-                    collect(item)
-                return
-            if not isinstance(payload, dict):
-                return
-            entry_type = str(payload.get("type", "")).strip().lower()
-            if entry_type == "reason":
-                text = str(payload.get("text", payload.get("message", payload.get("content", "")))).strip()
-                if text:
-                    entries.append(text)
-
-        for payload in payloads:
-            collect(payload)
-
-        return entries
-
-    def _text_signature(self, value: str) -> str:
-        return str(abs(hash(value)))
-
-    def _resolve_workspace_file(self, relative_path: str) -> Path | None:
-        rel = relative_path.strip()
-        if not rel:
-            return None
-        candidate = (self.workspace_root_path / rel).resolve()
-        try:
-            candidate.relative_to(self.workspace_root_path)
-        except ValueError:
-            return None
-        return candidate
-
-    def _build_edit_sync_prompt(self, *, relative_path: str, planning_context: str, full_file_content: str) -> str:
-        return (
-            f"Before editing '{relative_path}', use synchronized context below.\n"
-            "Planning entries currently in memory:\n"
-            f"{planning_context}\n\n"
-            f"Complete current file content for '{relative_path}':\n"
-            f"{full_file_content}\n\n"
-            "Now produce an updated full-file create_file tool call for this same path that preserves cross-file consistency."
-        )
-
-    def _build_structured_edit_sync_prompt(
-        self,
-        *,
-        tool_name: str,
-        relative_path: str,
-        planning_context: str,
-        full_file_content: str,
-    ) -> str:
-        return (
-            f"Before running {tool_name} on '{relative_path}', use synchronized context below.\n"
-            "Planning entries currently in memory:\n"
-            f"{planning_context}\n\n"
-            f"Complete current file content for '{relative_path}':\n"
-            f"{full_file_content}\n\n"
-            f"Now produce a corrected {tool_name} tool call for '{relative_path}' with precise parameters based on this latest content."
-        )
-
-    def _read_local_file(self, path: Path | None, *, max_chars: int = 200000) -> str:
-        if path is None or not path.exists() or not path.is_file():
-            return ""
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return ""
-        if len(text) > max_chars:
-            return text[:max_chars]
-        return text
-
-    def _build_diff_reflection_prompt(self, *, relative_path: str, before: str, after: str) -> str:
-        if before == after:
-            return ""
-        before_lines = before.splitlines()
-        after_lines = after.splitlines()
-        diff_lines = list(
-            difflib.unified_diff(
-                before_lines,
-                after_lines,
-                fromfile=f"{relative_path}:before",
-                tofile=f"{relative_path}:after",
-                lineterm="",
-            )
-        )
-        if not diff_lines:
-            return ""
-        preview = "\n".join(diff_lines[:220])
-        return (
-            f"Diff reflection for {relative_path}:\n"
-            f"{preview}\n\n"
-            "Reflect briefly in type=reason: does this fully resolve the intended change and any edge cases?"
-        )
-
-    def _build_tool_only_reasoning(self, tool_calls: list[dict[str, Any]]) -> str:
-        names = [str(item.get("name", "")).strip() for item in tool_calls if isinstance(item, dict)]
-        names = [name for name in names if name]
-        if not names:
-            return ""
-
-        plan_calls = [
-            item for item in tool_calls if isinstance(item, dict) and str(item.get("name", "")).strip() == "plan_web_build"
-        ]
-        if plan_calls:
-            latest_plan_call = plan_calls[-1]
-            args = latest_plan_call.get("arguments", {})
-            if not isinstance(args, dict):
-                args = {}
-            summary = str(args.get("summary", "")).strip()
-            features = args.get("prompt_features", [])
-            feature_list: list[str] = []
-            if isinstance(features, list):
-                feature_list = [str(item).strip() for item in features if str(item).strip()]
-            feature_text = ", ".join(feature_list[:8]) if feature_list else "(no explicit feature list)"
-            if summary:
-                return (
-                    "Planning update: "
-                    f"summary = {summary}. "
-                    f"Requested focus features = {feature_text}. "
-                    "Next I will refine concrete implementation phases and map them to specific files."
-                )
-            return (
-                "Planning update: plan_web_build was requested to produce concrete development phases. "
-                f"Requested focus features = {feature_text}. "
-                "Next I will use the generated phases to drive file-by-file implementation."
-            )
-
-        unique = []
-        seen: set[str] = set()
-        for name in names:
-            if name in seen:
-                continue
-            seen.add(name)
-            unique.append(name)
-        listing = ", ".join(unique)
-        return (
-            "I am taking an action-only step this turn to gather state and progress the plan. "
-            f"I selected: {listing}. After these results return, I will reason over them and continue with the next concrete edits."
-        )
-
-    def _build_plan_result_reason(self, *, arguments: dict[str, Any], result: dict[str, Any]) -> str:
-        summary = str(arguments.get("summary", "")).strip()
-        phases = result.get("phases", [])
-        phase_items: list[str] = []
-        if isinstance(phases, list):
-            phase_items = [str(item).strip() for item in phases if str(item).strip()]
-        if not phase_items and not summary:
-            return ""
-
-        phase_preview = " | ".join(phase_items[:6]) if phase_items else "(no phases returned)"
-        if summary:
-            return (
-                "Plan generated successfully. "
-                f"Summary: {summary}. "
-                f"Phases: {phase_preview}. "
-                "I will now execute these phases in order using focused edits and verification checkpoints."
-            )
-        return (
-            "Plan generated successfully. "
-            f"Phases: {phase_preview}. "
-            "I will now execute these phases in order using focused edits and verification checkpoints."
-        )
-
-    def _is_workspace_empty(self) -> bool:
-        ignored_roots = {
-            ".git",
-            ".venv",
-            "venv",
-            "node_modules",
-            "dist",
-            "build",
-            "coverage",
-            "__pycache__",
-            ".low-cortisol-html-logs",
-        }
-        for path in self.workspace_root_path.rglob("*"):
-            try:
-                rel = path.relative_to(self.workspace_root_path)
-            except ValueError:
-                continue
-            if not rel.parts:
-                continue
-            if any(part in ignored_roots or part.startswith(".") for part in rel.parts):
-                continue
-            return False
-        return True
-
-    def _deduplicate_tool_calls(self, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Remove duplicate tool calls (model often repeats the same call in content)."""
+    def _deduplicate_tool_calls(
+        self, tool_calls: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Remove duplicate tool calls."""
         seen: set[str] = set()
         unique: list[dict[str, Any]] = []
         for call in tool_calls:
@@ -1623,3 +853,685 @@ class LoopController:
             seen.add(key)
             unique.append(call)
         return unique
+
+    # ------------------------------------------------------------------
+    # UI event emitters
+    # ------------------------------------------------------------------
+
+    def _emit_reasoning(self, stage_name: str, content: str) -> None:
+        """Emit reasoning text to UI via stderr."""
+        clean = self._extract_clean_reasoning(content)
+        if clean:
+            self._emit_reasoning_raw(stage_name, clean)
+
+    def _emit_reasoning_raw(self, stage_name: str, text: str) -> None:
+        """Emit pre-cleaned reasoning text to UI — no further parsing."""
+        if not text:
+            return
+        payload: dict[str, str] = {"content": text}
+        if stage_name:
+            payload["stage"] = stage_name
+        print(
+            f"[response:agent] {json.dumps(payload, ensure_ascii=False)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _emit_code_block(self, filename: str, content: str) -> None:
+        """Emit a file's content as a [code] reasoning event for UI display."""
+        if not content.strip():
+            return
+        code_text = f"[code] {filename}\n{content}"
+        payload = {"content": code_text, "stage": "code"}
+        print(
+            f"[response:agent] {json.dumps(payload, ensure_ascii=False)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _extract_clean_reasoning(self, content: str) -> str:
+        """Extract human-readable reasoning from LLM output.
+
+        Handles:
+        - Lines prefixed with 'type=reason' -> strip prefix, keep text
+        - Lines prefixed with 'type=signal' -> discard (control messages)
+        - JSON envelopes with type=reason -> extract text
+        - ```lang code blocks -> emit separately as [code] events, replace inline
+        - qwen3 <think>...</think> blocks
+        """
+        stripped = content.strip()
+        if not stripped:
+            return ""
+
+        # Convert <think>...</think> blocks into readable reasoning
+        stripped = self._format_think_tags(stripped)
+
+        # Extract fenced code blocks and emit them separately
+        stripped = self._extract_and_emit_code_blocks(stripped)
+
+        # Strip inline type=reason / type=signal prefixes
+        stripped = self._strip_type_prefixes(stripped)
+
+        # Try line-by-line: separate JSON envelopes from plain text
+        reasons: list[str] = []
+        plain_text: list[str] = []
+
+        for line in stripped.split("\n"):
+            line = line.strip()
+            if not line:
+                plain_text.append("")
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    obj_type = str(obj.get("type", "")).lower()
+                    if obj_type == "reason":
+                        text = str(obj.get("text", obj.get("message", ""))).strip()
+                        if text:
+                            reasons.append(text)
+                    elif obj_type == "signal":
+                        continue
+                    elif obj_type in ("control", "chat"):
+                        text = str(obj.get("text", obj.get("message", ""))).strip()
+                        if text:
+                            reasons.append(text)
+                else:
+                    plain_text.append(line)
+            except json.JSONDecodeError:
+                plain_text.append(line)
+
+        if reasons:
+            return "\n".join(reasons)
+
+        # Try block-level JSON parsing
+        try:
+            payloads = self._extract_json_payloads(stripped)
+            for payload in payloads:
+                self._collect_reasons(payload, reasons)
+            if reasons:
+                return "\n".join(reasons)
+        except Exception:
+            pass
+
+        if plain_text:
+            result = "\n".join(plain_text)
+            result = re.sub(r"\n{3,}", "\n\n", result)
+            return result.strip()
+        return stripped
+
+    # ------------------------------------------------------------------
+    # LLM output cleaning helpers
+    # ------------------------------------------------------------------
+
+    _RE_TYPE_REASON = re.compile(r"^type\s*=\s*reason\s*", re.IGNORECASE)
+    _RE_TYPE_SIGNAL = re.compile(r"^type\s*=\s*signal\b.*$", re.IGNORECASE)
+
+    def _strip_type_prefixes(self, text: str) -> str:
+        r"""Strip 'type=reason' prefix from lines and remove 'type=signal' lines entirely."""
+        out: list[str] = []
+        for line in text.split("\n"):
+            stripped_line = line.strip()
+            if self._RE_TYPE_SIGNAL.match(stripped_line):
+                continue
+            m = self._RE_TYPE_REASON.match(stripped_line)
+            if m:
+                remainder = stripped_line[m.end():].strip()
+                if remainder:
+                    out.append(remainder)
+                continue
+            out.append(line)
+        return "\n".join(out)
+
+    _RE_CODE_FENCE = re.compile(
+        r"```(\w*)\n(.*?)```", re.DOTALL
+    )
+
+    def _extract_and_emit_code_blocks(self, text: str) -> str:
+        """Extract fenced code blocks, emit them as [code] reasoning events, and
+        replace them in the text with a short placeholder."""
+        parts: list[str] = []
+        last_end = 0
+        for m in self._RE_CODE_FENCE.finditer(text):
+            parts.append(text[last_end:m.start()])
+            lang = m.group(1).strip().lower()
+            code_body = m.group(2).strip()
+            filename = self._guess_code_filename(lang, code_body)
+
+            if lang == "json" and self._looks_like_tool_call(code_body):
+                last_end = m.end()
+                continue
+
+            # Skip empty code blocks entirely
+            if not code_body:
+                last_end = m.end()
+                continue
+
+            label = filename or lang or "code"
+            self._emit_reasoning_raw("code", f"[code] {label}\n{code_body}")
+            parts.append(f"[code: {label}]")
+            last_end = m.end()
+
+        parts.append(text[last_end:])
+        return "".join(parts)
+
+    @staticmethod
+    def _looks_like_tool_call(code: str) -> bool:
+        """Check if a code block looks like an embedded JSON tool call."""
+        try:
+            obj = json.loads(code)
+            if isinstance(obj, dict):
+                return any(k in obj for k in ("name", "action", "tool", "tool_calls"))
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return False
+
+    @staticmethod
+    def _guess_code_filename(lang: str, code: str) -> str:
+        """Try to guess a filename from the code block language or content."""
+        lang_to_ext = {
+            "html": "index.html",
+            "css": "styles.css",
+            "javascript": "script.js",
+            "js": "script.js",
+            "json": "",
+        }
+        if lang in lang_to_ext and lang_to_ext[lang]:
+            return lang_to_ext[lang]
+        first_line = code.split("\n", 1)[0].strip()
+        if first_line.startswith("//") or first_line.startswith("/*"):
+            for token in first_line.split():
+                if "." in token and not token.startswith("//") and not token.startswith("/*"):
+                    clean = token.strip("*/").strip()
+                    if clean:
+                        return clean
+        return ""
+
+    def _extract_json_payloads(self, text: str) -> list[Any]:
+        """Extract all top-level JSON objects from text."""
+        payloads: list[Any] = []
+        decoder = json.JSONDecoder()
+        index = 0
+        while index < len(text):
+            while index < len(text) and text[index].isspace():
+                index += 1
+            if index >= len(text):
+                break
+            try:
+                payload, end_index = decoder.raw_decode(text, index)
+            except json.JSONDecodeError:
+                break
+            payloads.append(payload)
+            index = end_index
+        return payloads
+
+    def _collect_reasons(self, payload: Any, reasons: list[str]) -> None:
+        """Recursively collect reason text from JSON payloads."""
+        if isinstance(payload, list):
+            for item in payload:
+                self._collect_reasons(item, reasons)
+            return
+        if not isinstance(payload, dict):
+            return
+        obj_type = str(payload.get("type", "")).lower()
+        if obj_type == "reason":
+            text = str(payload.get("text", payload.get("message", ""))).strip()
+            if text:
+                reasons.append(text)
+        elif payload.get("action") == "call_tool" and isinstance(payload.get("result"), dict):
+            rendered = self._format_tool_result_reasoning(
+                name=str(payload.get("tool", "")).strip(),
+                result=payload,
+            )
+            if rendered:
+                reasons.append(rendered)
+        for value in payload.values():
+            if isinstance(value, (dict, list)):
+                self._collect_reasons(value, reasons)
+
+    def _format_tool_result_reasoning(self, *, name: str, result: dict[str, Any]) -> str:
+        if not isinstance(result, dict):
+            return ""
+        nested = result.get("result") if isinstance(result.get("result"), dict) else result
+        if not isinstance(nested, dict):
+            return ""
+
+        summary = str(nested.get("summary", "")).strip()
+        file_structure = nested.get("file_structure")
+        features: list[str] = []
+        for key in ("elements", "css_features", "js_features", "prompt_features", "phases"):
+            value = nested.get(key)
+            if isinstance(value, list):
+                features.extend(str(item).strip() for item in value if str(item).strip())
+
+        lines: list[str] = []
+        display_name = name or str(result.get("tool", "")).strip()
+        if display_name:
+            lines.append(f"Tool result: {display_name}")
+        if summary:
+            lines.append(f"Summary: {summary}")
+
+        if isinstance(file_structure, dict) and file_structure:
+            lines.append("Planned files:")
+            for rel, desc in file_structure.items():
+                rel_text = str(rel).strip()
+                if not rel_text:
+                    continue
+                desc_text = str(desc).strip()
+                if desc_text:
+                    lines.append(f"- {rel_text}: {desc_text}")
+                else:
+                    lines.append(f"- {rel_text}")
+
+        if features:
+            lines.append("Key features:")
+            for feature in features[:10]:
+                lines.append(f"- {feature}")
+
+        if not lines:
+            return ""
+        return "\n".join(lines)
+
+    def _extract_tool_calls_from_text(self, content: str) -> list[dict[str, Any]]:
+        """Adaptively extract tool calls written as text/JSON in the LLM response."""
+        calls: list[dict[str, Any]] = []
+        for m in re.finditer(r"```(?:json)?\s*\n(.*?)```", content, re.DOTALL):
+            body = m.group(1).strip()
+            try:
+                obj = json.loads(body)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(obj, dict):
+                items = [obj]
+            elif isinstance(obj, list):
+                items = [x for x in obj if isinstance(x, dict)]
+            else:
+                continue
+            for item in items:
+                if "name" in item or "tool" in item:
+                    name = str(item.get("name", item.get("tool", ""))).strip()
+                    args = item.get("arguments", item.get("params", item.get("input", {})))
+                    if name and isinstance(args, dict):
+                        normalized_name, normalized_args = self._normalize_tool_call(
+                            {"name": name, "arguments": args}
+                        )
+                        calls.append({"name": normalized_name, "arguments": normalized_args})
+        return self._deduplicate_tool_calls(calls)
+
+    def _emit_terminal_logs(self, tool_name: str, result: dict[str, Any]) -> None:
+        if not isinstance(result, dict):
+            return
+
+        # Handle top-level error (MCP server exception)
+        top_error = result.get("error")
+        if isinstance(top_error, dict):
+            self._emit_reasoning_raw("terminal", f"tool={tool_name} ok=False")
+            msg = str(top_error.get("message", "")).strip()
+            etype = str(top_error.get("type", "")).strip()
+            if msg:
+                self._emit_reasoning_raw("terminal", f"error: {etype}: {msg}" if etype else f"error: {msg}")
+            return
+        elif isinstance(top_error, str) and top_error.strip():
+            self._emit_reasoning_raw("terminal", f"tool={tool_name} ok=False")
+            self._emit_reasoning_raw("terminal", f"error: {top_error.strip()}")
+            return
+
+        nested = result.get("result") if isinstance(result, dict) else None
+        if not isinstance(nested, dict):
+            return
+
+        self._emit_reasoning_raw("terminal", f"tool={tool_name} ok={bool(nested.get('ok', False))}")
+        stdout_text = str(nested.get("stdout", "")).strip()
+        stderr_text = str(nested.get("stderr", "")).strip()
+        if stdout_text:
+            for line in stdout_text.splitlines():
+                text = line.strip()
+                if text:
+                    self._emit_reasoning_raw("terminal", text[:500])
+        if stderr_text:
+            for line in stderr_text.splitlines():
+                text = line.strip()
+                if text:
+                    self._emit_reasoning_raw("terminal", text[:500])
+
+        missing_files = nested.get("missing_files")
+        if isinstance(missing_files, list) and missing_files:
+            self._emit_reasoning_raw("terminal", "missing_files: " + ", ".join(str(item) for item in missing_files))
+
+        issues = nested.get("issues")
+        if isinstance(issues, list) and issues:
+            self._emit_reasoning_raw("terminal", "issues: " + " | ".join(str(item) for item in issues))
+
+        error_payload = nested.get("error")
+        if isinstance(error_payload, dict):
+            message = str(error_payload.get("message", "")).strip()
+            if message:
+                self._emit_reasoning_raw("terminal", f"error: {message}")
+        elif isinstance(error_payload, str) and error_payload.strip():
+            self._emit_reasoning_raw("terminal", f"error: {error_payload.strip()}")
+
+    def _extract_error_details(self, result: dict[str, Any]) -> str:
+        if not isinstance(result, dict):
+            return "unknown error"
+
+        parts: list[str] = []
+
+        top_error = result.get("error")
+        if isinstance(top_error, dict):
+            msg = str(top_error.get("message", "")).strip()
+            etype = str(top_error.get("type", "")).strip()
+            if msg:
+                parts.append(f"{etype}: {msg}" if etype else msg)
+        elif isinstance(top_error, str) and top_error.strip():
+            parts.append(top_error.strip())
+
+        nested = result.get("result")
+        if isinstance(nested, dict):
+            stderr = str(nested.get("stderr", "")).strip()
+            stdout = str(nested.get("stdout", "")).strip()
+            if stderr:
+                parts.append(stderr)
+            if stdout:
+                parts.append(stdout)
+
+            missing_files = nested.get("missing_files")
+            if isinstance(missing_files, list) and missing_files:
+                parts.append("missing_files: " + ", ".join(str(item) for item in missing_files))
+
+            issues = nested.get("issues")
+            if isinstance(issues, list) and issues:
+                parts.append("issues: " + " | ".join(str(item) for item in issues))
+
+            error_payload = nested.get("error")
+            if isinstance(error_payload, dict):
+                message = str(error_payload.get("message", "")).strip()
+                if message:
+                    parts.append(message)
+            elif isinstance(error_payload, str) and error_payload.strip():
+                parts.append(error_payload.strip())
+
+        return "\n".join(part for part in parts if part) or "unknown error"
+
+    def _emit_tool_call_event(
+        self, *, tool_name: str, arguments: dict[str, Any]
+    ) -> None:
+        """Emit tool call event to UI via stderr."""
+        safe_args: dict[str, Any] = {}
+        for key, value in arguments.items():
+            if key in {"content", "replacement_text"} and isinstance(value, str):
+                safe_args[key] = f"<trimmed:{len(value)} chars>"
+            else:
+                safe_args[key] = value
+        print(
+            f"[tool:call] {json.dumps({'name': tool_name, 'arguments': safe_args}, ensure_ascii=False)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    @staticmethod
+    def _format_think_tags(text: str) -> str:
+        """Convert qwen3 <think>...</think> blocks into labelled reasoning text."""
+        def _replace_block(m: re.Match) -> str:
+            inner = m.group(1).strip()
+            if not inner:
+                return ""
+            return f"[thinking] {inner}\n"
+
+        formatted = re.sub(
+            r"<think>(.*?)</think>",
+            _replace_block,
+            text,
+            flags=re.DOTALL,
+        )
+        formatted = re.sub(
+            r"<think>(.*?)$",
+            lambda m: f"[thinking] {m.group(1).strip()}\n" if m.group(1).strip() else "",
+            formatted,
+            flags=re.DOTALL,
+        )
+        return formatted.strip() if formatted.strip() else text.strip()
+
+    @staticmethod
+    def _strip_think_tags(text: str) -> str:
+        """Remove qwen3 <think>...</think> blocks."""
+        cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL).strip()
+        return cleaned if cleaned else text.strip()
+
+    # ------------------------------------------------------------------
+    # Summary generation
+    # ------------------------------------------------------------------
+
+    def _generate_summary(
+        self, *, task: str, tool_trace: list[dict[str, Any]]
+    ) -> str:
+        """Generate a final summary of changes via LLM.
+
+        Asks the model to produce a markdown-formatted summary describing
+        the features built, files created, and key implementation details.
+        """
+        changed_files = sorted(
+            {
+                str(item.get("arguments", {}).get("relative_path", "")).strip()
+                for item in tool_trace
+                if isinstance(item, dict)
+                and str(item.get("tool", "")) == "create_file"
+                and str(item.get("arguments", {}).get("relative_path", "")).strip()
+            }
+        )
+
+        # Read file contents for richer summary
+        file_snippets: list[str] = []
+        for fname in changed_files[:6]:
+            fpath = self.workspace_root_path / fname
+            if fpath.is_file():
+                try:
+                    raw = fpath.read_text(errors="replace")[:3000]
+                    file_snippets.append(f"--- {fname} ---\n{raw}")
+                except Exception:
+                    pass
+
+        summary_prompt = (
+            "You are summarising what was just built for the user.\n"
+            "Write a clear, helpful markdown summary. Do NOT start with 'DONE:'.\n"
+            "Use the following structure:\n"
+            "1. A **bold one-line headline** describing what was built.\n"
+            "2. A bullet list of the key **features / interactions** the user can try.\n"
+            "3. A short **Files** section listing each file and a one-line description.\n\n"
+            f"Original request: {task}\n\n"
+            "Files created/updated:\n"
+            + (
+                "\n".join(f"- {f}" for f in changed_files[:20])
+                if changed_files
+                else "- (none)"
+            )
+        )
+        if file_snippets:
+            summary_prompt += "\n\nFile contents (for reference):\n" + "\n".join(file_snippets)
+
+        try:
+            response = self.ollama_client.chat(
+                model=self.model_name,
+                messages=[{"role": "user", "content": summary_prompt}],
+                tools=[],
+                stream=False,
+                num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 40000),
+                num_predict=1200,
+            )
+            msg = self.ollama_client.extract_assistant_message(response)
+            text = str(msg.get("content", "")).strip()
+            # Strip <think> blocks the model might add
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+            if text:
+                return text
+        except Exception:
+            pass
+
+        # Fallback: build a basic markdown summary ourselves
+        if changed_files:
+            lines = [f"**Built: {task.strip()[:80]}**", ""]
+            lines.append("**Files:**")
+            for f in changed_files:
+                lines.append(f"- {f}")
+            return "\n".join(lines)
+        return f"**Task completed:** {task.strip()[:120]}"
+
+    # ------------------------------------------------------------------
+    # Memory management
+    # ------------------------------------------------------------------
+
+    def _compact_memory(self, memory: SessionMemory) -> None:
+        """Compact memory if it exceeds the character budget."""
+        budget = _env_int("ORCHESTRATOR_MEMORY_CHAR_BUDGET", 120000)
+        total = sum(len(str(m.get("content", ""))) + 50 for m in memory.messages)
+        if total <= budget:
+            return
+
+        head = memory.messages[:2]
+        tail_count = _env_int("ORCHESTRATOR_MEMORY_TAIL_COUNT", 16)
+        tail = (
+            memory.messages[-tail_count:]
+            if len(memory.messages) > tail_count
+            else list(memory.messages)
+        )
+
+        middle = (
+            memory.messages[2:-tail_count]
+            if len(memory.messages) > (2 + tail_count)
+            else []
+        )
+        summary_lines: list[str] = []
+        for item in middle[-10:]:
+            role = str(item.get("role", ""))
+            text = str(item.get("content", "")).strip()[:200]
+            if text:
+                summary_lines.append(f"- {role}: {text}")
+
+        summary_text = "Memory compacted. Prior conversation summary:\n" + (
+            "\n".join(summary_lines) if summary_lines else "- (no summary)"
+        )
+
+        memory.messages = [*head, {"role": "user", "content": summary_text}, *tail]
+
+    # ------------------------------------------------------------------
+    # Workspace helpers
+    # ------------------------------------------------------------------
+
+    def _read_created_files(
+        self,
+        created_files: set[str],
+        *,
+        extensions: set[str],
+        exclude_patterns: set[str] | None = None,
+        max_chars_per_file: int = 10000,
+    ) -> str:
+        """Read created files matching the given extensions and return their contents."""
+        exclude = exclude_patterns or set()
+        blocks: list[str] = []
+        for rel in sorted(created_files):
+            if not any(rel.endswith(ext) for ext in extensions):
+                continue
+            rel_lower = rel.lower()
+            if any(pat in rel_lower for pat in exclude):
+                continue
+            file_path = self.workspace_root_path / rel
+            if not file_path.is_file():
+                continue
+            try:
+                content = file_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if not content.strip():
+                continue
+            if len(content) > max_chars_per_file:
+                content = content[:max_chars_per_file] + "\n... (truncated)"
+            blocks.append(f"--- {rel} ---\n{content}\n--- end {rel} ---")
+        return "\n\n".join(blocks)
+
+    def _get_relevant_file_context(self, query: str, top_k: int = 4) -> str:
+        """Use ProjectMemory to retrieve semantically relevant files for a query."""
+        try:
+            self.project_memory.refresh()
+            retrieved = self.project_memory.retrieve(query=query, top_k=top_k)
+            if not retrieved:
+                return ""
+            return self.project_memory.build_retrieval_context(
+                retrieved=retrieved,
+                include_full_top_n=min(2, len(retrieved)),
+                max_full_chars=8000,
+            )
+        except Exception:
+            return ""
+
+    def _build_workspace_manifest(self, max_files: int = 32) -> str:
+        """Build a manifest of workspace files."""
+        files: list[str] = []
+        ignored = {
+            ".git", ".venv", "venv", "node_modules", "__pycache__",
+            ".low-cortisol-html-logs",
+        }
+        for path in sorted(self.workspace_root_path.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = str(path.relative_to(self.workspace_root_path).as_posix())
+            if any(
+                part.startswith(".") or part in ignored
+                for part in rel.split("/")
+            ):
+                continue
+            files.append(rel)
+            if len(files) >= max_files:
+                break
+
+        if not files:
+            return (
+                "Workspace is empty. This is a new project. "
+                "All files need to be created."
+            )
+
+        return "Current workspace files:\n" + "\n".join(f"- {f}" for f in files)
+
+    def _normalize_path(self, raw_path: str) -> str:
+        """Normalize a workspace-relative path.
+
+        Aggressively strips absolute-path prefixes that LLMs commonly emit.
+        """
+        candidate = raw_path.strip().replace("\\", "/")
+        if not candidate:
+            return "."
+
+        if candidate.startswith("/"):
+            try:
+                path_obj = Path(candidate)
+                resolved = path_obj.expanduser().resolve()
+                relative = resolved.relative_to(self.workspace_root_path.resolve())
+                candidate = str(relative)
+                if not candidate or candidate == ".":
+                    return "."
+            except (ValueError, OSError):
+                pass
+
+        ws_name = self.workspace_root_path.name
+        marker = f"/{ws_name}/"
+        idx = candidate.find(marker)
+        if idx != -1:
+            candidate = candidate[idx + len(marker):]
+
+        marker_end = f"/{ws_name}"
+        if candidate.endswith(marker_end) or candidate == ws_name:
+            return "."
+
+        if candidate.startswith(f"{ws_name}/"):
+            candidate = candidate[len(ws_name) + 1:]
+
+        candidate = candidate.lstrip("/")
+        while candidate.startswith("./"):
+            candidate = candidate[2:]
+        candidate = candidate.rstrip("/")
+
+        return candidate or "."
+
+    def _as_chat_envelope(self, text: str) -> str:
+        """Wrap text in a chat JSON envelope."""
+        return json.dumps(
+            {"type": "chat", "text": text.strip()}, ensure_ascii=False
+        )

@@ -4,7 +4,7 @@
 
 This phase implemented the first working orchestrator skeleton that can:
 
-1. Connect to Ollama (`qwen3:14b`) via local HTTP API.
+1. Connect to Ollama (`qwen2.5-coder:14b`) via local HTTP API.
 2. Send a static tool list to the model.
 3. Receive and interpret structured tool calls.
 4. Route tool executions to the MCP server.
@@ -30,7 +30,7 @@ Key behaviors:
 - Accepts:
   - `--workspace-root` (absolute workspace path)
   - `--task` (user prompt)
-  - `--model` (default: `qwen3:14b`)
+  - `--model` (default: `qwen2.5-coder:14b`)
 - Defines and sends a static tool schema list (`STATIC_TOOLS`) to the model.
 - Initializes:
   - Ollama client
@@ -121,12 +121,12 @@ Observed:
 
 Observed:
 - `http://localhost:11434/api/tags` reachable.
-- Local models detected, including `qwen3:14b`.
+- Local models detected, including `qwen2.5-coder:14b`.
 
 ### C) Real-model structured tool-call loop
 
 Command used:
-- `python3 orchestrator/main_orchestrator.py --workspace-root "$PWD" --task "Use the dummy_sandbox_echo tool on relative path docs, then say DONE." --model qwen3:14b`
+- `python3 orchestrator/main_orchestrator.py --workspace-root "$PWD" --task "Use the dummy_sandbox_echo tool on relative path docs, then say DONE." --model qwen2.5-coder:14b`
 
 Observed:
 - Tool call executed successfully.

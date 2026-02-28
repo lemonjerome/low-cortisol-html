@@ -36,7 +36,7 @@ class OllamaClient:
 
     def list_model_names(self) -> list[str]:
         if self._mock_enabled:
-            return ["qwen3:14b", "nomic-embed-text"]
+            return ["qwen2.5-coder:14b", "nomic-embed-text"]
 
         health = self.health()
         if not health.get("ok"):
@@ -189,33 +189,6 @@ class OllamaClient:
             "tool_calls": [],
         }
         final_chunk: dict[str, Any] = {}
-        stream_buffer = ""
-
-        def flush_stream_buffer(force: bool = False) -> None:
-            nonlocal stream_buffer
-            if not stream_label:
-                return
-            candidate = stream_buffer
-            if not candidate:
-                return
-
-            if not force and "\n" not in candidate and len(candidate) < 140:
-                return
-
-            if "\n" in candidate:
-                parts = candidate.split("\n")
-                lines_to_emit = parts[:-1]
-                stream_buffer = parts[-1]
-                for line in lines_to_emit:
-                    text = line.strip()
-                    if text:
-                        print(f"[stream:{stream_label}] {text}", file=sys.stderr, flush=True)
-                return
-
-            text = candidate.strip()
-            if text:
-                print(f"[stream:{stream_label}] {text}", file=sys.stderr, flush=True)
-            stream_buffer = ""
 
         try:
             with urllib.request.urlopen(request, timeout=600) as response:
@@ -232,6 +205,12 @@ class OllamaClient:
                         continue
 
                     final_chunk = chunk
+                    if stream_label in {"architect", "coder"}:
+                        print(
+                            f"[stream_raw:{stream_label}] {json.dumps(chunk, ensure_ascii=False)}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     message = chunk.get("message")
                     if not isinstance(message, dict):
                         if chunk.get("done") is True:
@@ -241,8 +220,12 @@ class OllamaClient:
                     piece = message.get("content", "")
                     if isinstance(piece, str) and piece:
                         assembled_message["content"] = f"{assembled_message.get('content', '')}{piece}"
-                        stream_buffer = f"{stream_buffer}{piece}"
-                        flush_stream_buffer(force=False)
+                        if stream_label and stream_label not in {"architect", "coder"}:
+                            print(
+                                f"[stream:{stream_label}] {json.dumps({'text': piece}, ensure_ascii=False)}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
 
                     tool_calls = message.get("tool_calls")
                     if isinstance(tool_calls, list) and tool_calls:
@@ -255,8 +238,6 @@ class OllamaClient:
             raise RuntimeError(f"Ollama HTTP error {error.code}: {detail}") from error
         except Exception as error:  # noqa: BLE001
             raise RuntimeError(f"Ollama request failed: {error}") from error
-
-        flush_stream_buffer(force=True)
 
         return {
             "model": model,

@@ -1,1 +1,0 @@
-make me a note taking app where i can write edit delete and manage notes using crud. design the page. don't make it boring

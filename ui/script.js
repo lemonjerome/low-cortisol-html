@@ -1,5 +1,6 @@
 const state = {
   working: false,
+  hasProject: false,
   currentAssistantBubble: null,
   currentThinkingEl: null,
   currentWorkspacesRoot: "",
@@ -7,7 +8,11 @@ const state = {
   folderChooserAvailable: true,
   folderChooserReason: "",
   lastStatusLabel: "",
+  stopAbortTimeoutId: null,
 };
+
+const reasoningStreamNodes = new Map();
+let reasoningStreamAutoId = 0;
 
 const chatStream = document.getElementById("chatStream");
 const actionsStream = document.getElementById("actionsStream");
@@ -15,28 +20,31 @@ const reasoningStream = document.getElementById("reasoningStream");
 const chatForm = document.getElementById("chatForm");
 const chatInput = document.getElementById("chatInput");
 const sendBtn = document.getElementById("sendBtn");
+const projectIndicator = document.getElementById("projectIndicator");
 
-const startupModal = document.getElementById("startupModal");
-const startupRootInput = document.getElementById("startupRootInput");
-const startupError = document.getElementById("startupError");
-const chooseButtons = [
-  document.getElementById("startupChooseBtn"),
-  document.getElementById("newParentChooseBtn"),
-  document.getElementById("openProjectChoose"),
-];
-
-function startsWithLch(pathText) {
-  const normalized = (pathText || "").trim().replace(/[\\/]+$/, "");
-  if (!normalized) return false;
-  const parts = normalized.split(/[\\/]/).filter(Boolean);
-  const name = parts[parts.length - 1] || "";
-  return name.startsWith("lch_");
+function updateProjectIndicator(projectName) {
+  if (!projectIndicator) return;
+  if (projectName) {
+    state.hasProject = true;
+    projectIndicator.textContent = "\u25cf " + projectName;
+    projectIndicator.className = "project-indicator project-indicator-active";
+    chatInput.disabled = false;
+    chatInput.placeholder = "Describe what you want to build or change...";
+    if (!state.working) sendBtn.disabled = false;
+  } else {
+    state.hasProject = false;
+    projectIndicator.textContent = "No project loaded";
+    projectIndicator.className = "project-indicator project-indicator-none";
+    chatInput.disabled = true;
+    chatInput.placeholder = "Open or create a project to start...";
+    sendBtn.disabled = true;
+  }
 }
 
 function setWorking(working) {
   state.working = working;
-  sendBtn.disabled = false;
-  chatInput.disabled = working;
+  sendBtn.disabled = working ? false : !state.hasProject;
+  chatInput.disabled = working || !state.hasProject;
   sendBtn.textContent = working ? "Stop" : "Send";
   sendBtn.classList.toggle("danger", working);
   sendBtn.classList.toggle("primary", !working);
@@ -50,9 +58,9 @@ function hideModal(id) {
   document.getElementById(id).classList.remove("visible");
 }
 
-function appendAction(text) {
+function appendAction(text, kind = "default") {
   const item = document.createElement("div");
-  item.className = "action-item";
+  item.className = `action-item action-${kind}`;
   item.textContent = text;
   actionsStream.appendChild(item);
   actionsStream.scrollTop = actionsStream.scrollHeight;
@@ -101,13 +109,185 @@ function summarizeToolArguments(tool, args = {}) {
   return JSON.stringify(args);
 }
 
+function renderMarkdown(text) {
+  // Lightweight markdown → HTML renderer for reasoning display.
+  // Handles: headers, bold, italic, inline code, lists, paragraphs.
+  let html = text
+    // Escape HTML entities first
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+  // Fenced code blocks ```lang\n...\n```
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    return `<pre class="md-code-block"><code>${code.trim()}</code></pre>`;
+  });
+
+  // Split into lines for block-level parsing
+  const lines = html.split("\n");
+  const out = [];
+  let inList = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i];
+
+    // Headers ### → <strong class="md-heading">
+    const headingMatch = line.match(/^(#{1,4})\s+(.+)$/);
+    if (headingMatch) {
+      if (inList) { out.push("</ul>"); inList = false; }
+      const level = headingMatch[1].length;
+      out.push(`<strong class="md-h${level}">${headingMatch[2]}</strong>`);
+      continue;
+    }
+
+    // Unordered list items: - item or * item
+    const listMatch = line.match(/^\s*[-*]\s+(.+)$/);
+    if (listMatch) {
+      if (!inList) { out.push('<ul class="md-list">'); inList = true; }
+      out.push(`<li>${listMatch[1]}</li>`);
+      continue;
+    }
+
+    // Numbered list items: 1. item
+    const numMatch = line.match(/^\s*\d+\.\s+(.+)$/);
+    if (numMatch) {
+      if (!inList) { out.push('<ul class="md-list md-list-num">'); inList = true; }
+      out.push(`<li>${numMatch[1]}</li>`);
+      continue;
+    }
+
+    if (inList) { out.push("</ul>"); inList = false; }
+
+    // Empty line → small spacer
+    if (!line.trim()) {
+      out.push('<div class="md-spacer"></div>');
+      continue;
+    }
+
+    out.push(`<span>${line}</span>`);
+  }
+  if (inList) out.push("</ul>");
+
+  html = out.join("\n");
+
+  // Inline styles
+  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
+  html = html.replace(/`([^`]+)`/g, '<code class="md-inline-code">$1</code>');
+
+  return html;
+}
+
 function appendReasoning(stage, text) {
   if (!text) return;
   const item = document.createElement("div");
-  item.className = "reason-item";
-  item.textContent = `[${stage}] ${text}`;
+  const normalizedStage = String(stage || "state").toLowerCase();
+  item.className = `reason-item reason-${normalizedStage}`;
+
+  // Code blocks get special rendering
+  if (normalizedStage === "code") {
+    const lines = text.split("\n");
+    const firstLine = lines[0] || "";
+    // First line is "[code] filename", rest is code body
+    const labelMatch = firstLine.match(/^\[code\]\s*(.*)$/i);
+    const label = labelMatch ? labelMatch[1].trim() : "code";
+    const codeBody = lines.slice(1).join("\n").trim();
+
+    // Skip empty code blocks entirely (no body to display)
+    if (!codeBody) return;
+
+    const header = document.createElement("div");
+    header.className = "reason-code-header";
+    header.textContent = `[code] ${label}`;
+    item.appendChild(header);
+
+    if (codeBody) {
+      const pre = document.createElement("pre");
+      pre.className = "reason-code-body";
+      const codeEl = document.createElement("code");
+      codeEl.textContent = codeBody;
+      pre.appendChild(codeEl);
+      item.appendChild(pre);
+    }
+  } else {
+    // Render markdown for all text reasoning
+    const stageLabel = document.createElement("span");
+    stageLabel.className = "reason-stage-label";
+    stageLabel.textContent = `[${stage}] `;
+    item.appendChild(stageLabel);
+
+    const content = document.createElement("div");
+    content.className = "reason-content";
+    content.innerHTML = renderMarkdown(text);
+    item.appendChild(content);
+  }
+
   reasoningStream.appendChild(item);
   reasoningStream.scrollTop = reasoningStream.scrollHeight;
+}
+
+function ensureReasoningStreamNode(streamId, stage) {
+  if (!streamId) return null;
+  if (reasoningStreamNodes.has(streamId)) {
+    return reasoningStreamNodes.get(streamId);
+  }
+  const item = document.createElement("div");
+  const normalizedStage = String(stage || "state").toLowerCase();
+  item.className = `reason-item reason-${normalizedStage}`;
+  item.classList.add("reason-streaming");
+  item.textContent = `[${stage}] `;
+  reasoningStream.appendChild(item);
+  reasoningStream.scrollTop = reasoningStream.scrollHeight;
+  const node = { item, stage };
+  reasoningStreamNodes.set(streamId, node);
+  return node;
+}
+
+function appendReasoningStreamToken(event) {
+  const token = String(event.token || "").toLowerCase();
+  const streamId = String(event.stream_id || "").trim();
+  const stage = event.stage || "state";
+  if (!streamId) return;
+  if (token === "start") {
+    ensureReasoningStreamNode(streamId, stage);
+    return;
+  }
+  const node = ensureReasoningStreamNode(streamId, stage);
+  if (!node) return;
+  if (token === "chunk") {
+    node.item.textContent += String(event.text || "");
+    reasoningStream.scrollTop = reasoningStream.scrollHeight;
+    return;
+  }
+  if (token === "word") {
+    node.item.textContent += String(event.text || "");
+    reasoningStream.scrollTop = reasoningStream.scrollHeight;
+    return;
+  }
+  if (token === "end") {
+    node.item.classList.remove("reason-streaming");
+    reasoningStreamNodes.delete(streamId);
+  }
+}
+
+function streamReasoningText(stage, text) {
+  const cleaned = String(text || "");
+  if (!cleaned.trim()) return;
+  reasoningStreamAutoId += 1;
+  const streamId = `legacy-${String(stage || "state").toLowerCase()}-${reasoningStreamAutoId}`;
+  appendReasoningStreamToken({ token: "start", stream_id: streamId, stage });
+  const parts = cleaned.match(/\S+\s*/g) || [];
+  for (const part of parts) {
+    appendReasoningStreamToken({ token: "word", stream_id: streamId, stage, text: part });
+  }
+  appendReasoningStreamToken({ token: "end", stream_id: streamId, stage });
+}
+
+function closeAllReasoningStreams() {
+  for (const node of reasoningStreamNodes.values()) {
+    node.item.classList.remove("reason-streaming");
+  }
+  reasoningStreamNodes.clear();
 }
 
 function createChatRow(userText) {
@@ -119,7 +299,7 @@ function createChatRow(userText) {
   user.textContent = userText;
 
   const assistant = document.createElement("div");
-  assistant.className = "assistant-bubble";
+  assistant.className = "agent-output";
   assistant.textContent = "";
 
   const thinking = document.createElement("div");
@@ -142,6 +322,14 @@ function clearUiMemory() {
   reasoningStream.innerHTML = "";
   state.currentAssistantBubble = null;
   state.currentThinkingEl = null;
+  closeAllReasoningStreams();
+}
+
+function clearStopAbortTimeout() {
+  if (state.stopAbortTimeoutId) {
+    window.clearTimeout(state.stopAbortTimeoutId);
+    state.stopAbortTimeoutId = null;
+  }
 }
 
 async function apiPost(path, payload = {}) {
@@ -157,39 +345,59 @@ async function apiPost(path, payload = {}) {
   return data;
 }
 
-async function chooseFolder() {
-  if (!state.folderChooserAvailable) {
-    throw new Error(state.folderChooserReason || "Folder chooser unavailable in this runtime.");
+// ---- Project picker (loads lch_ folders from lch_workspaces) ----
+async function _loadProjectPicker() {
+  const listEl = document.getElementById("projectPickerList");
+  const errEl = document.getElementById("openProjectError");
+  listEl.innerHTML = '<div class="project-picker-loading">Loading projects...</div>';
+  errEl.textContent = "";
+  try {
+    const res = await fetch("/api/browse-dir?path=" + encodeURIComponent(state.currentWorkspacesRoot || ""));
+    const data = await res.json();
+    if (!data.ok) { errEl.textContent = data.error || "Could not read lch_workspaces"; listEl.innerHTML = ""; return; }
+    const dirs = data.entries.filter(e => e.is_dir && e.name.startsWith("lch_"));
+    listEl.innerHTML = "";
+    if (dirs.length === 0) {
+      listEl.innerHTML = '<div class="project-picker-empty">No projects found.<br>Use <strong>New Project</strong> to create one.</div>';
+      return;
+    }
+    for (const entry of dirs) {
+      const row = document.createElement("div");
+      row.className = "project-picker-item";
+      row.textContent = entry.name;
+      row.addEventListener("click", async () => {
+        errEl.textContent = "";
+        const projectPath = data.path + "/" + entry.name;
+        try {
+          await apiPost("/api/open-project", { projectPath });
+          clearUiMemory();
+          hideModal("openProjectModal");
+          updateProjectIndicator(entry.name);
+          appendAction("project opened: " + entry.name, "system");
+        } catch (err) {
+          errEl.textContent = err.message;
+        }
+      });
+      listEl.appendChild(row);
+    }
+  } catch (err) {
+    errEl.textContent = err.message || "Network error";
+    listEl.innerHTML = "";
   }
-  const data = await apiPost("/api/choose-folder", {});
-  return data.path;
 }
 
-function applyFolderChooserAvailability() {
-  for (const button of chooseButtons) {
-    if (!button) continue;
-    button.disabled = !state.folderChooserAvailable;
-    button.title = state.folderChooserAvailable
-      ? "Open folder picker"
-      : state.folderChooserReason || "Folder chooser unavailable in this runtime.";
-  }
-}
+
 
 async function loadStatus() {
   const response = await fetch("/api/status");
   const data = await response.json();
-  startupRootInput.value = data.workspaces_root || "";
   state.currentWorkspacesRoot = data.workspaces_root || "";
-  state.folderChooserAvailable = Boolean(data.folder_chooser_available);
-  state.folderChooserReason = data.folder_chooser_reason || "";
-  applyFolderChooserAvailability();
-  if (!state.folderChooserAvailable && startupError) {
-    startupError.textContent = state.folderChooserReason;
-  }
+  updateProjectIndicator(data.current_project_name || null);
 }
 
 async function submitChat(message) {
   setWorking(true);
+  state.lastStatusLabel = "";
   createChatRow(message);
   state.chatAbortController = new AbortController();
 
@@ -226,7 +434,7 @@ async function submitChat(message) {
         state.currentThinkingEl.textContent = event.label || "working...";
         const label = String(event.label || "").trim();
         if (label && label !== state.lastStatusLabel) {
-          appendAction(`status: ${label}`);
+          appendAction(`status: ${label}`, "status");
           state.lastStatusLabel = label;
         }
       }
@@ -236,52 +444,67 @@ async function submitChat(message) {
           appendReasoning(event.stage || "state", reasoningText);
         }
       }
+      if (event.type === "reasoning_stream") {
+        appendReasoningStreamToken(event);
+      }
       if (event.type === "action") {
         if (event.tool === "file_edit") {
-          appendAction(`file updated: ${event.arguments.relative_path}`);
+          appendAction(`file updated: ${event.arguments.relative_path}`, "file");
         } else {
-          appendAction(`tool: ${event.tool} ${summarizeToolArguments(event.tool, event.arguments || {})}`);
+          appendAction(`tool: ${event.tool} ${summarizeToolArguments(event.tool, event.arguments || {})}`, "tool");
         }
       }
       if (event.type === "chat_chunk" && state.currentAssistantBubble) {
         state.currentAssistantBubble.textContent = event.text || "";
       }
       if (event.type === "chat_final" && state.currentAssistantBubble) {
-        state.currentAssistantBubble.textContent = event.text || "";
+        state.currentAssistantBubble.innerHTML = renderMarkdown(event.text || "");
+        state.currentAssistantBubble.classList.add("agent-markdown");
       }
       if (event.type === "error" && state.currentAssistantBubble) {
         state.currentAssistantBubble.textContent = `Error: ${event.message || "Unknown error"}`;
+        appendAction(`error: ${event.message || "Unknown error"}`, "error");
+        closeAllReasoningStreams();
       }
       if (event.type === "stopped") {
-        appendAction(event.message || "execution stopped");
+        appendAction(event.message || "execution stopped", "stopped");
         if (state.currentAssistantBubble) {
           state.currentAssistantBubble.textContent = event.message || "Execution stopped by user.";
         }
+        if (state.currentThinkingEl) {
+          state.currentThinkingEl.remove();
+          state.currentThinkingEl = null;
+        }
+        closeAllReasoningStreams();
       }
       if (event.type === "done") {
         if (state.currentThinkingEl) {
           state.currentThinkingEl.remove();
           state.currentThinkingEl = null;
         }
+        closeAllReasoningStreams();
       }
     }
   }
 
   state.chatAbortController = null;
+  clearStopAbortTimeout();
   setWorking(false);
 }
 
 async function stopCurrentRun() {
+  appendAction("stop requested", "stopped");
   try {
     await apiPost("/api/stop", {});
   } catch (error) {
-    appendAction(`stop error: ${error.message}`);
+    appendAction(`stop error: ${error.message}`, "error");
   }
-  if (state.chatAbortController) {
-    state.chatAbortController.abort();
-  }
-  setWorking(false);
-  appendAction("stop requested");
+  clearStopAbortTimeout();
+  state.stopAbortTimeoutId = window.setTimeout(() => {
+    if (state.chatAbortController) {
+      state.chatAbortController.abort();
+    }
+  }, 2500);
 }
 
 chatForm.addEventListener("submit", async (event) => {
@@ -298,12 +521,20 @@ chatForm.addEventListener("submit", async (event) => {
     await submitChat(message);
   } catch (error) {
     if (error.name === "AbortError") {
-      appendAction("execution aborted in browser");
+      appendAction("execution aborted in browser", "stopped");
+      if (state.currentThinkingEl) {
+        state.currentThinkingEl.remove();
+        state.currentThinkingEl = null;
+      }
+      state.chatAbortController = null;
+      clearStopAbortTimeout();
+      setWorking(false);
       return;
     }
     state.chatAbortController = null;
+    clearStopAbortTimeout();
     setWorking(false);
-    appendAction(`error: ${error.message}`);
+    appendAction(`error: ${error.message}`, "error");
     if (state.currentThinkingEl) {
       state.currentThinkingEl.remove();
       state.currentThinkingEl = null;
@@ -329,31 +560,17 @@ chatInput.addEventListener("keydown", (event) => {
   chatForm.requestSubmit();
 });
 
-document.getElementById("startupChooseBtn").addEventListener("click", async () => {
-  try {
-    startupRootInput.value = await chooseFolder();
-  } catch (error) {
-    startupError.textContent = error.message;
-  }
+document.getElementById("helpBtn").addEventListener("click", () => showModal("tutorialModal"));
+document.getElementById("tutorialClose").addEventListener("click", () => {
+  sessionStorage.setItem("tutorialSeen", "1");
+  hideModal("tutorialModal");
 });
-
-document.getElementById("startupValidateBtn").addEventListener("click", async () => {
-  startupError.textContent = "";
-  try {
-    const startupPath = startupRootInput.value.trim();
-    if (!startsWithLch(startupPath)) {
-      throw new Error("Warning: Workspace parent directory must start with 'lch_'.");
-    }
-    const data = await apiPost("/api/set-workspaces-root", { path: startupPath });
-    state.currentWorkspacesRoot = data.workspaces_root;
-    hideModal("startupModal");
-  } catch (error) {
-    startupError.textContent = error.message;
-  }
+document.getElementById("tutorialGotIt").addEventListener("click", () => {
+  sessionStorage.setItem("tutorialSeen", "1");
+  hideModal("tutorialModal");
 });
 
 document.getElementById("newProjectBtn").addEventListener("click", () => {
-  document.getElementById("newParentInput").value = state.currentWorkspacesRoot;
   document.getElementById("newWorkspaceName").value = "lch_new_project";
   document.getElementById("newProjectError").textContent = "";
   showModal("newProjectModal");
@@ -361,72 +578,35 @@ document.getElementById("newProjectBtn").addEventListener("click", () => {
 
 document.getElementById("newProjectCancel").addEventListener("click", () => hideModal("newProjectModal"));
 
-document.getElementById("newParentChooseBtn").addEventListener("click", async () => {
-  try {
-    document.getElementById("newParentInput").value = await chooseFolder();
-  } catch (error) {
-    document.getElementById("newProjectError").textContent = error.message;
-  }
-});
-
 document.getElementById("newProjectCreate").addEventListener("click", async () => {
   const errorEl = document.getElementById("newProjectError");
   errorEl.textContent = "";
   try {
-    const parentDir = document.getElementById("newParentInput").value.trim();
     const workspaceName = document.getElementById("newWorkspaceName").value.trim();
-    if (!startsWithLch(parentDir)) {
-      throw new Error("Warning: Parent directory must start with 'lch_'.");
-    }
     if (!workspaceName.startsWith("lch_")) {
-      throw new Error("Warning: Workspace directory must start with 'lch_'.");
+      throw new Error("Folder name must start with 'lch_'.");
     }
+    // Always create inside lch_workspaces
     await apiPost("/api/create-project", {
-      parentDir,
+      parentDir: state.currentWorkspacesRoot,
       workspaceName,
     });
     clearUiMemory();
     hideModal("newProjectModal");
-    appendAction("new project created and loaded");
+    updateProjectIndicator(workspaceName);
+    appendAction("new project created: " + workspaceName, "system");
   } catch (error) {
     errorEl.textContent = error.message;
   }
 });
 
 document.getElementById("openProjectBtn").addEventListener("click", () => {
-  document.getElementById("openProjectPath").value = "";
   document.getElementById("openProjectError").textContent = "";
   showModal("openProjectModal");
+  _loadProjectPicker();
 });
 
 document.getElementById("openProjectCancel").addEventListener("click", () => hideModal("openProjectModal"));
-
-document.getElementById("openProjectChoose").addEventListener("click", async () => {
-  try {
-    document.getElementById("openProjectPath").value = await chooseFolder();
-  } catch (error) {
-    document.getElementById("openProjectError").textContent = error.message;
-  }
-});
-
-document.getElementById("openProjectConfirm").addEventListener("click", async () => {
-  const errorEl = document.getElementById("openProjectError");
-  errorEl.textContent = "";
-  try {
-    const projectPath = document.getElementById("openProjectPath").value.trim();
-    if (!startsWithLch(projectPath)) {
-      throw new Error("Warning: Project directory must start with 'lch_'.");
-    }
-    await apiPost("/api/open-project", {
-      projectPath,
-    });
-    clearUiMemory();
-    hideModal("openProjectModal");
-    appendAction("project opened and memory reset");
-  } catch (error) {
-    errorEl.textContent = error.message;
-  }
-});
 
 document.getElementById("clearChatBtn").addEventListener("click", () => showModal("clearChatModal"));
 document.getElementById("clearChatCancel").addEventListener("click", () => hideModal("clearChatModal"));
@@ -435,18 +615,18 @@ document.getElementById("clearChatConfirm").addEventListener("click", async () =
   await apiPost("/api/clear-chat", {});
   clearUiMemory();
   hideModal("clearChatModal");
-  appendAction("chat memory cleared");
+  appendAction("chat memory cleared", "system");
 });
 
 document.getElementById("openHtmlBtn").addEventListener("click", async () => {
   try {
     const data = await apiPost("/api/open-main-html", {});
-    appendAction(`opened main html: ${data.main_html}`);
+    appendAction(`opened main html: ${data.main_html}`, "system");
     if (data.workspace_url) {
       window.open(data.workspace_url, "_blank", "noopener,noreferrer");
     }
   } catch (error) {
-    appendAction(`open html error: ${error.message}`);
+    appendAction(`open html error: ${error.message}`, "error");
   }
 });
 
@@ -454,7 +634,12 @@ document.getElementById("openHtmlBtn").addEventListener("click", async () => {
   try {
     await loadStatus();
   } catch (error) {
-    startupError.textContent = error.message;
+    appendAction(`startup error: ${error.message}`, "error");
+  }
+  // Show tutorial on first visit (once per browser session)
+  const tutorialSeen = sessionStorage.getItem("tutorialSeen");
+  if (!tutorialSeen) {
+    showModal("tutorialModal");
   }
 })();
 

@@ -11,7 +11,10 @@
       <div class="topbar-left">
         <button id="openHtmlBtn" class="btn">Open HTML</button>
       </div>
-      <div class="topbar-title">&lt;low cortisol html/&gt;</div>
+      <div class="topbar-title">
+        &lt;low cortisol html/&gt;
+        <button id="helpBtn" class="btn btn-help" title="How to use this app">?</button>
+      </div>
       <div class="topbar-right">
         <button id="newProjectBtn" class="btn">New Project</button>
         <button id="openProjectBtn" class="btn">Open Project</button>
@@ -29,40 +32,24 @@
         <div id="reasoningStream" class="stream mono"></div>
       </section>
       <section class="column chat-column">
-        <h2>Chat</h2>
+        <div class="chat-column-header">
+          <h2>Chat</h2>
+          <div id="projectIndicator" class="project-indicator project-indicator-none">No project loaded</div>
+        </div>
         <div id="chatStream" class="chat-stream"></div>
         <form id="chatForm" class="chat-form">
-          <textarea id="chatInput" rows="3" placeholder="Type your request..."></textarea>
-          <button id="sendBtn" type="submit" class="btn primary">Send</button>
+          <textarea id="chatInput" rows="3" placeholder="Open or create a project to start..." disabled></textarea>
+          <button id="sendBtn" type="submit" class="btn primary" disabled>Send</button>
         </form>
       </section>
     </main>
 
-    <div id="startupModal" class="modal-backdrop visible">
-      <div class="modal">
-        <h3>Workspace Root</h3>
-        <p>Set the absolute parent directory for LSH workspaces before starting.</p>
-        <label class="field-label">Workspace parent directory</label>
-        <div class="input-row">
-          <input id="startupRootInput" type="text" />
-          <button id="startupChooseBtn" class="btn">Choose</button>
-        </div>
-        <div class="modal-actions">
-          <button id="startupValidateBtn" class="btn primary">Validate & Continue</button>
-        </div>
-        <div id="startupError" class="error"></div>
-      </div>
-    </div>
-
+    <div id="startupModal" class="modal-backdrop" style="display:none"><!-- removed: workspace root is auto-detected --></div>
     <div id="newProjectModal" class="modal-backdrop">
       <div class="modal">
         <h3>New Project</h3>
-        <label class="field-label">Parent directory</label>
-        <div class="input-row">
-          <input id="newParentInput" type="text" />
-          <button id="newParentChooseBtn" class="btn">Choose</button>
-        </div>
-        <label class="field-label">Workspace folder name</label>
+        <p class="modal-subtext">Creates a new folder inside <code>lch_workspaces</code> on your Desktop.</p>
+        <label class="field-label">Folder name</label>
         <input id="newWorkspaceName" type="text" value="lch_new_project" />
         <div class="modal-actions">
           <button id="newProjectCancel" class="btn">Cancel</button>
@@ -75,16 +62,12 @@
     <div id="openProjectModal" class="modal-backdrop">
       <div class="modal">
         <h3>Open Project</h3>
-        <label class="field-label">Project absolute path</label>
-        <div class="input-row">
-          <input id="openProjectPath" type="text" />
-          <button id="openProjectChoose" class="btn">Choose</button>
-        </div>
+        <p class="modal-subtext">Choose a project from <code>lch_workspaces</code> on your Desktop.</p>
+        <div id="projectPickerList" class="project-picker-list"></div>
+        <div id="openProjectError" class="error"></div>
         <div class="modal-actions">
           <button id="openProjectCancel" class="btn">Cancel</button>
-          <button id="openProjectConfirm" class="btn primary">Open</button>
         </div>
-        <div id="openProjectError" class="error"></div>
       </div>
     </div>
 
@@ -98,6 +81,68 @@
         </div>
       </div>
     </div>
+
+    <div id="tutorialModal" class="modal-backdrop visible">
+      <div class="modal modal-tutorial">
+        <div class="tutorial-header">
+          <h3>&lt;low cortisol html/&gt; — How it works</h3>
+          <button id="tutorialClose" class="btn btn-icon" title="Close">&times;</button>
+        </div>
+
+        <div class="tutorial-notice">
+          ⚠️ <strong>Heads up:</strong> This agent uses a local LLM running on your machine. It works best for
+          <strong>simple to medium HTML/CSS/JS projects</strong>. Complex frameworks, multi-page apps, or
+          advanced logic may not be generated correctly.
+        </div>
+
+        <div class="tutorial-section">
+          <div class="tutorial-section-title">📋 Workflow</div>
+          <ol class="tutorial-list">
+            <li><strong>Create or open a project</strong> — use the header buttons to set up a workspace folder.</li>
+            <li><strong>Type your request</strong> in the Chat column and press Send.</li>
+            <li>The agent <strong>plans</strong> first, then <strong>writes all files</strong> (HTML, CSS, JS) in one pass.</li>
+            <li>Click <strong>Open HTML</strong> to preview the result in a new tab.</li>
+            <li>You can follow up — say "add a dark mode" or "fix the layout" and it will update the existing files.</li>
+          </ol>
+        </div>
+
+        <div class="tutorial-section">
+          <div class="tutorial-section-title">🖥️ The three columns</div>
+          <ul class="tutorial-list">
+            <li><strong>Actions</strong> — live log of every tool call (file writes, validation, plan registration).</li>
+            <li><strong>Reasoning / Thinking / Debugging</strong> — the agent's internal reasoning, planning details, and the final code written to each file.</li>
+            <li><strong>Chat</strong> — your conversation. Type requests here and read the agent's summary when it finishes.</li>
+          </ul>
+        </div>
+
+        <div class="tutorial-section">
+          <div class="tutorial-section-title">🔘 Header buttons</div>
+          <ul class="tutorial-list">
+            <li><strong>Open HTML</strong> — opens the generated <code>index.html</code> in a new tab via the local server.</li>
+            <li><strong>New Project</strong> — creates a new empty workspace folder inside <code>lch_workspaces</code> on your Desktop.</li>
+            <li><strong>Open Project</strong> — loads an existing <code>lch_</code> project folder so the agent can read and edit it.</li>
+            <li><strong>Clear Chat</strong> — resets the in-memory conversation context (does not delete files).</li>
+            <li><strong>?</strong> — opens this tutorial.</li>
+          </ul>
+        </div>
+
+        <div class="tutorial-section">
+          <div class="tutorial-section-title">💡 Tips</div>
+          <ul class="tutorial-list">
+            <li>The agent detects whether the workspace is empty or has existing files and adjusts its approach.</li>
+            <li>Be specific — describe colours, layout, and interactions you want.</li>
+            <li>Workspace folders must start with <code>lch_</code> — this keeps them organised in <code>lch_workspaces</code>.</li>
+            <li>All projects are stored in <code>lch_workspaces</code> on your Desktop, mirrored into the container.</li>
+          </ul>
+        </div>
+
+        <div class="modal-actions">
+          <button id="tutorialGotIt" class="btn primary">Got it, let's build!</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="folderBrowserModal" class="modal-backdrop" style="display:none"><!-- unused --></div>
 
     <script src="/script.js"></script>
   </body>

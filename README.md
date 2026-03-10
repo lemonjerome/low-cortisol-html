@@ -14,10 +14,12 @@ You open the UI at `localhost:8000`, create or open a project, and send a messag
 
 The agent then:
 
-1. **Plans** — thinks through the structure, features, and layout in detail.
-2. **Writes** — creates `index.html`, `styles.css`, and `script.js` (and any other files needed) in one pass.
-3. **Validates** — checks that all file links and references are consistent.
-4. **Shows you** — streams its reasoning and file writes to the UI as it works.
+1. **Plans** — thinks through features, UI flow, and the class-name contract shared across all three files.
+2. **Writes HTML** — creates `index.html` with semantic structure, all element IDs, initial state classes, and a template comment for dynamically created elements.
+3. **Writes JS** — creates `script.js` using the exact IDs from the HTML, with localStorage persistence, modal toggling, and edit-state tracking.
+4. **Writes CSS** — creates `styles.css` using the exact class names from the HTML and JS, including all button variants, dynamic element styles, and the required `.hidden` rule.
+5. **Validates** — checks that all file links and references are consistent.
+6. **Shows you** — streams its reasoning and file writes to the UI as it works.
 
 When it is done, you click **Open HTML** to view the result in your browser.
 
@@ -70,28 +72,47 @@ Every tool call goes through the MCP server. The server validates the inputs, en
 
 The orchestrator is the Python process that connects the UI, the language model, and the MCP server.
 
-### Two-stage pipeline
+### Four-stage pipeline
 
-The agent always works in exactly two stages:
+The agent works in four sequential stages, each focused on exactly one task:
 
-**Stage 1 — Plan**
+**Stage 1 — Feature Plan** (`feature_plan`)
 
-The model receives the task and the current workspace state (empty or populated with existing files). It calls `plan_web_build` to produce a structured plan: features, layout, interaction model, development phases. For existing projects the agent reads the current files first so it understands what is already there.
+The model receives the task and workspace state. It calls `plan_web_build` to produce a structured plan covering: features, UI flow, file connections, and a cross-file class-name contract (which IDs JS will query, which classes CSS will style, which classes JS will toggle on dynamic elements). For existing projects the agent reads current files first.
 
-**Stage 2 — Code**
+Allowed tools: `plan_web_build`, `read_file`, `list_directory`
 
-The model receives the plan and calls `create_file` for every file it needs to produce. It writes the complete content of each file in one call — HTML, CSS, and JavaScript all at once. The stage ends when no more files need to be written.
+**Stage 2 — HTML** (`html_code`)
 
-After both stages the orchestrator runs a validation check and streams a summary back to the UI.
+The model receives the plan and the HTML skill guide, then writes the complete `index.html`. It must include all element IDs, initial `hidden` classes on modals and panels, a persistent add/create button in the header, and an HTML comment documenting the structure of dynamically created elements.
+
+Allowed tools: `create_file`, `read_file`
+
+**Stage 3 — JavaScript** (`js_code`)
+
+The model receives the plan, the JS skill guide, and the completed HTML (so it can reference exact IDs). It writes the complete `script.js` with localStorage persistence, modal open/close using the `hidden` class only, edit-state tracking via a module-level variable, and event delegation for dynamic elements.
+
+Allowed tools: `create_file`, `read_file`
+
+**Stage 4 — CSS** (`css_code`)
+
+The model receives the plan, the CSS skill guide, the completed HTML, and the completed JS (so it can see every class name in use). It writes the complete `styles.css` with `.hidden { display: none !important; }`, all standard button classes, styles for every dynamic element class, and modal overlay styling.
+
+Allowed tools: `create_file`, `read_file`
+
+After all four stages the orchestrator runs a validation check and streams a summary back to the UI.
 
 ### How the model is guided
 
 A few techniques work together to keep the output reliable:
 
+- **Skill files** — each coding stage injects a dedicated skill guide (`skills/html.md`, `skills/js.md`, `skills/css.md`) that defines exact rules, patterns, and anti-patterns for that file type. These cover the cross-file class-name contract, modal patterns, edit-state tracking, and more.
+- **Cross-file class contract** — the system enforces that HTML, JS, and CSS all agree on every class name. The only allowed visibility toggle is `hidden`. JS must only toggle classes CSS defines. CSS must style every class JS creates in dynamic elements. Banned alternatives (`is-open`, `show`, `visible`, etc.) are explicitly listed in every skill file and stage prompt.
 - **Planner** — before the stages begin, a separate lightweight LLM call produces a rationale and a retrieval query. This helps the tool pruner pick the most relevant tools to show the model.
 - **Tool pruning** — tools are ranked by semantic similarity to the current task using text embeddings. Only the most relevant tools are included in the model's context window, reducing noise. A reranker model then fine-tunes the order.
 - **Alias normalization** — models sometimes refer to tools by informal names (`edit_file`, `write_file`, `open_file`). The controller maps these to the correct MCP tool names automatically.
 - **Inline call extraction** — if a model writes tool calls as raw JSON text instead of structured calls, the controller parses and executes them.
+- **XML error retry** — if the model returns a malformed tool call that causes an Ollama XML parse error, the controller retries the stage without tools and extracts any tool calls from the text response.
 - **Retry on empty** — if the model returns nothing for a stage, the controller sends a nudge and retries once.
 - **Context compaction** — long conversation histories are trimmed so the model does not run out of context mid-task.
 - **Project memory** — a semantic index of the workspace files provides file-level retrieval context so the model can orient itself in existing projects.
@@ -238,6 +259,10 @@ compilot/
 ├── mcp_server/           MCP server + tool implementations
 │   └── tools/            Individual tool modules
 ├── orchestrator/         Agent logic (loop, planner, reranker, memory)
+├── skills/               Skill guides injected into each coding stage
+│   ├── html.md           HTML rules: semantics, IDs, state classes, modal pattern
+│   ├── js.md             JS rules: modal toggling, edit-state tracking, escapeHtml usage
+│   └── css.md            CSS rules: .hidden contract, button classes, dynamic element styles
 ├── tests/                Guardrail safety tests
 └── ui/                   Browser UI (HTML/CSS/JS + Python server)
 ```

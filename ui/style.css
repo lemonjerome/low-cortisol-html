@@ -272,21 +272,22 @@ body {
 
 /* Pipeline stage colors */
 
-.reason-feature_plan,
-.reason-html_plan,
-.reason-css_plan,
-.reason-js_plan,
-.reason-tests_plan {
+.reason-feature_plan {
   background: #12202e;
   border-color: #1a3350;
 }
 
 .reason-html_code,
 .reason-css_code,
-.reason-js_code,
-.reason-tests_code {
+.reason-js_code {
   background: #1a1528;
   border-color: #2d2245;
+}
+
+.reason-validate,
+.reason-summary {
+  background: #12202e;
+  border-color: #1a3350;
 }
 
 .reason-reranker,

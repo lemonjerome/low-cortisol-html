@@ -1,10 +1,14 @@
-"""Two-stage pipeline agent for building HTML/CSS/JS apps.
+"""Multi-stage pipeline agent for building HTML/CSS/JS apps.
 
 Pipeline:
-  1. Detect workspace state (empty vs populated)
-  2. Plan — one comprehensive planning pass
-  3. Code — write all files in a single pass
-  4. Done
+    1. Detect workspace state (empty vs populated)
+    2. feature_plan — General plan + features (context: user prompt + existing files)
+    3. html_code   — Create HTML (context: general plan + html.md skill + existing html)
+    4. js_code     — Create JS  (context: general plan + js.md skill + completed html + existing js)
+    5. css_code    — Create CSS (context: general plan + css.md skill + completed html + existing css)
+    6. validate    — Syntax and error validation
+    7. summary     — Working summary (displayed in chat column with markdown)
+    8. Done
 """
 
 from __future__ import annotations
@@ -35,50 +39,49 @@ TOOL_NAME_ALIASES: dict[str, str] = {
     "list_files": "list_directory",
 }
 
-# Two ordered pipeline stages
+# Ordered pipeline stages
 STAGES: list[tuple[str, str]] = [
-    ("plan", "Create a comprehensive, detailed plan for the project"),
-    ("code", "Write all necessary files in one pass using create_file"),
+    ("feature_plan", "Plan the general app concept, features, and file structure"),
+    ("html_code", "Write the complete index.html file"),
+    ("js_code", "Write the complete script.js file"),
+    ("css_code", "Write the complete styles.css file"),
 ]
 
 # Tools allowed per stage
 STAGE_TOOLS: dict[str, list[str]] = {
-    "plan": ["plan_web_build", "read_file", "list_directory"],
-    "code": ["create_file"],
+    "feature_plan": ["plan_web_build", "read_file", "list_directory"],
+    "html_code": ["create_file", "read_file"],
+    "js_code": ["create_file", "read_file"],
+    "css_code": ["create_file", "read_file"],
 }
 
 SYSTEM_PROMPT = (
     "You are a frontend coding agent that builds HTML/CSS/JS web apps.\n"
-    "You work in two stages: first you plan thoroughly, then you write all files.\n"
+    "You work in sequential stages: plan features, write HTML, write JS, write CSS.\n"
+    "Each stage focuses on ONE task. Follow the skill guides provided.\n"
     "\n"
     "CRITICAL RULES:\n"
     "- Use RELATIVE paths only (e.g. 'index.html', 'styles.css', 'script.js').\n"
     "  NEVER use absolute paths like /root/Desktop/... or /home/user/...\n"
-    "- Planning stage: reason about what to build. Be comprehensive and detailed.\n"
-    "  Cover every feature, every element ID, every function, every connection.\n"
-    "- Coding stage: use the create_file tool to write COMPLETE file contents.\n"
-    "  Write ALL files (HTML, CSS, JS) in one pass. Every file must be complete.\n"
+    "- The planning stage: reason about what to build. Be thorough.\n"
+    "- Coding stages: use the create_file tool to write COMPLETE file contents.\n"
+    "  Each coding stage writes exactly ONE file. The file must be complete.\n"
     "- Always generate code that matches the planned features exactly.\n"
     "- Keep reasoning in plain text, no JSON envelopes.\n"
     "- Do NOT prefix lines with 'type=reason' or 'type=signal'.\n"
     "- Use only the tools provided for each stage.\n"
     "- For create_file: always write the full file, not partial snippets.\n"
     "\n"
-    "HTML RULES:\n"
-    "- Give EVERY interactive element a unique, descriptive id attribute.\n"
-    "- Use semantic HTML5 (<header>, <main>, <section>, <form>, <footer>).\n"
-    "- Link stylesheet: <link rel=\"stylesheet\" href=\"styles.css\"> in <head>.\n"
-    "- Link script: <script src=\"script.js\"></script> before </body>.\n"
-    "\n"
-    "CSS RULES:\n"
-    "- Target the exact IDs, classes, and elements from your HTML.\n"
-    "- Do NOT invent selectors for elements that don't exist.\n"
-    "- Include responsive design and clean typography.\n"
-    "\n"
-    "JAVASCRIPT RULES:\n"
-    "- script.js must reference the exact element IDs from index.html.\n"
-    "- Separate pure logic (data manipulation, validation) into named functions.\n"
-    "- Export logic functions: if (typeof module !== 'undefined') { module.exports = { fn1, fn2 }; }\n"
+    "CROSS-FILE CLASS NAME CONTRACT (Critical):\n"
+    "- HTML is the source of truth for all IDs and class names.\n"
+    "- JS must reference ONLY IDs and classes that exist in the HTML.\n"
+    "- CSS must style ONLY IDs and classes that exist in the HTML.\n"
+    "- The ONLY state classes for toggling visibility are: hidden, active, disabled.\n"
+    "- NEVER use: is-open, is-hidden, is-visible, show, visible, open, closed.\n"
+    "- Modals start with class='hidden' in HTML. JS removes 'hidden' to show.\n"
+    "- CSS must always define: .hidden { display: none !important; }\n"
+    "- When JS creates dynamic elements, it must use class names that CSS styles.\n"
+    "- All three files must agree on every class name. No mismatches.\n"
 )
 
 
@@ -94,10 +97,14 @@ def _env_int(name: str, default: int) -> int:
 
 
 class LoopController:
-    """Two-stage pipeline controller.
+    """Multi-stage pipeline controller.
 
     Detects whether the workspace is empty (new project) or populated
-    (existing project), then runs: Plan -> Code -> Done.
+    (existing project), then runs:
+      feature_plan -> html_code -> js_code -> css_code -> validate -> summary -> Done.
+
+    Skill files (skills/html.md, skills/js.md, skills/css.md) are injected
+    as context for each coding stage.
     """
 
     def __init__(
@@ -211,6 +218,15 @@ class LoopController:
         created_files: set[str] = set()
         max_tool_calls = _env_int("ORCHESTRATOR_MAX_TOOL_CALLS_PER_ITERATION", 12)
 
+        # --- Load skill files ---
+        skill_texts: dict[str, str] = {}
+        for skill_name in ("html", "js", "css"):
+            skill_path = self.project_root / "skills" / f"{skill_name}.md"
+            try:
+                skill_texts[skill_name] = skill_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                skill_texts[skill_name] = ""
+
         # --- Detect workspace state ---
         workspace_state = self._detect_workspace_state()
         is_empty = workspace_state["is_empty"]
@@ -259,21 +275,25 @@ class LoopController:
         self._current_retrieval_query = retrieval_query
         self._current_plan = planner_result
 
+        # Track the general plan text for downstream stages
+        general_plan_text: str = ""
+
         # --- Execute stages ---
         for stage_name, stage_desc in STAGES:
             iteration += 1
-
             print(f"[status:agent] stage: {stage_name}", file=sys.stderr, flush=True)
             stage_label = stage_name.replace("_", " ").title()
             self._emit_reasoning(stage_name, f"Starting stage: {stage_label}")
 
-            # Build stage prompt
+            # Build stage prompt with appropriate context
             stage_prompt = self._build_stage_prompt(
                 stage_name=stage_name,
                 stage_desc=stage_desc,
                 task=task,
                 created_files=created_files,
                 workspace_state=workspace_state,
+                general_plan=general_plan_text,
+                skill_texts=skill_texts,
             )
             memory.add("user", stage_prompt)
 
@@ -289,25 +309,50 @@ class LoopController:
             except Exception:
                 pass
 
-            # Call LLM
-            print("[status:agent] calling model...", file=sys.stderr, flush=True)
+            is_code_stage = stage_name.endswith("_code")
             num_predict = _env_int("ORCHESTRATOR_AGENT_NUM_PREDICT", 8192)
-            if stage_name == "code":
-                # Allow much more output for writing all files at once
+            if is_code_stage:
                 num_predict = _env_int("ORCHESTRATOR_CODE_NUM_PREDICT", 16384)
 
-            response = self.ollama_client.chat(
-                model=self.model_name,
-                messages=memory.messages,
-                tools=stage_tools,
-                stream=False,
-                num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 40000),
-                num_predict=num_predict,
-            )
-
-            message = self.ollama_client.extract_assistant_message(response)
-            content = str(message.get("content", ""))
-            tool_calls = self.ollama_client.extract_tool_calls(message)
+            # Call LLM with robust error handling
+            try:
+                print("[status:agent] calling model...", file=sys.stderr, flush=True)
+                response = self.ollama_client.chat(
+                    model=self.model_name,
+                    messages=memory.messages,
+                    tools=stage_tools,
+                    stream=False,
+                    num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 40000),
+                    num_predict=num_predict,
+                )
+                message = self.ollama_client.extract_assistant_message(response)
+                content = str(message.get("content", ""))
+                tool_calls = self.ollama_client.extract_tool_calls(message)
+            except RuntimeError as err:
+                err_msg = str(err)
+                if "XML syntax error" in err_msg or "unexpected end element" in err_msg:
+                    self._emit_reasoning(stage_name, f"Model returned malformed XML, retrying without tools...")
+                    # Retry without tools to avoid XML parsing issue
+                    try:
+                        response = self.ollama_client.chat(
+                            model=self.model_name,
+                            messages=memory.messages,
+                            tools=[],
+                            stream=False,
+                            num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 40000),
+                            num_predict=num_predict,
+                        )
+                        message = self.ollama_client.extract_assistant_message(response)
+                        content = str(message.get("content", ""))
+                        tool_calls = []
+                        # Try to extract tool calls from the text content
+                        if content.strip() and is_code_stage:
+                            tool_calls = self._extract_tool_calls_from_text(content)
+                    except RuntimeError:
+                        self._emit_reasoning(stage_name, f"Retry also failed. Skipping stage.")
+                        continue
+                else:
+                    raise
 
             # Normalize and deduplicate tool calls
             tool_calls = [
@@ -317,7 +362,7 @@ class LoopController:
             tool_calls = self._deduplicate_tool_calls(tool_calls)
 
             # Adaptive: extract tool calls from text if model wrote them inline
-            if not tool_calls and content.strip() and stage_name == "code":
+            if not tool_calls and content.strip() and is_code_stage:
                 inline_calls = self._extract_tool_calls_from_text(content)
                 if inline_calls:
                     tool_calls = inline_calls
@@ -351,13 +396,13 @@ class LoopController:
                     for n, a in (self._normalize_tool_call(tc) for tc in tool_calls)
                 ]
                 tool_calls = self._deduplicate_tool_calls(tool_calls)
-                if not tool_calls and content.strip() and stage_name == "code":
+                if not tool_calls and content.strip() and is_code_stage:
                     tool_calls = self._extract_tool_calls_from_text(content)
 
             # Emit reasoning to UI
             if content.strip():
                 self._emit_reasoning(stage_name, content)
-            elif tool_calls and stage_name == "code":
+            elif tool_calls and is_code_stage:
                 file_names = []
                 for tc in tool_calls:
                     tc_name = str(tc.get("name", ""))
@@ -368,6 +413,11 @@ class LoopController:
                             file_names.append(rel)
                 if file_names:
                     self._emit_reasoning(stage_name, f"Writing files: {', '.join(file_names)}")
+
+            # Capture general plan text for downstream stages
+            clean_content = self._strip_think_tags(content).strip()
+            if stage_name == "feature_plan":
+                general_plan_text = clean_content
 
             # Execute tool calls
             allowed = set(STAGE_TOOLS.get(stage_name, []))
@@ -427,10 +477,10 @@ class LoopController:
             memory.add("assistant", content, tool_calls=tool_calls)
             self._compact_memory(memory)
 
-        # --- Run validation at the end (informational only) ---
+        # --- Run validation at the end ---
         self._run_validation(tool_trace=tool_trace, memory=memory, iteration=iteration + 1)
 
-        # --- Generate summary and return ---
+        # --- Generate summary (displayed in chat column with markdown) ---
         summary = self._generate_summary(task=task, tool_trace=tool_trace)
 
         return {
@@ -455,33 +505,50 @@ class LoopController:
         task: str,
         created_files: set[str],
         workspace_state: dict[str, Any],
+        general_plan: str = "",
+        skill_texts: dict[str, str] | None = None,
     ) -> str:
         is_empty = workspace_state["is_empty"]
+        skill_texts = skill_texts or {}
         lines = [f"=== STAGE: {stage_name} ===", stage_desc, ""]
 
         if created_files:
             lines.append("Known files: " + ", ".join(sorted(created_files)))
             lines.append("")
 
-        # ------ PLAN stage ------
-        if stage_name == "plan":
+        # ------ FEATURE_PLAN stage ------
+        if stage_name == "feature_plan":
             if is_empty:
-                lines.extend(self._build_new_project_plan_prompt(task))
+                lines.extend(self._build_new_project_feature_plan_prompt(task))
             else:
-                lines.extend(self._build_existing_project_plan_prompt(task, workspace_state))
+                lines.extend(self._build_existing_project_feature_plan_prompt(task, workspace_state))
 
-        # ------ CODE stage ------
-        elif stage_name == "code":
-            if is_empty:
-                lines.extend(self._build_new_project_code_prompt(task, created_files))
-            else:
-                lines.extend(self._build_existing_project_code_prompt(task, created_files, workspace_state))
+        # ------ HTML_CODE stage ------
+        elif stage_name == "html_code":
+            lines.extend(self._build_html_code_prompt(
+                task, general_plan, created_files, workspace_state, skill_texts.get("html", ""),
+            ))
+
+        # ------ JS_CODE stage ------
+        elif stage_name == "js_code":
+            lines.extend(self._build_js_code_prompt(
+                task, general_plan, created_files, workspace_state, skill_texts.get("js", ""),
+            ))
+
+        # ------ CSS_CODE stage ------
+        elif stage_name == "css_code":
+            lines.extend(self._build_css_code_prompt(
+                task, general_plan, created_files, workspace_state, skill_texts.get("css", ""),
+            ))
 
         return "\n".join(lines)
 
-    def _build_new_project_plan_prompt(self, task: str) -> list[str]:
-        """Build a comprehensive planning prompt for a fresh/empty project."""
-        # Inject semantic file context from project memory
+    # ------------------------------------------------------------------
+    # Feature plan prompts
+    # ------------------------------------------------------------------
+
+    def _build_new_project_feature_plan_prompt(self, task: str) -> list[str]:
+        """Build a comprehensive feature planning prompt for a fresh/empty project."""
         file_context = self._get_relevant_file_context(task)
         lines: list[str] = []
         if file_context:
@@ -497,7 +564,7 @@ class LoopController:
             "",
             "This is a NEW, EMPTY project. You must plan everything from scratch.",
             "",
-            "Create a COMPREHENSIVE and DETAILED plan covering ALL of the following:",
+            "Create a high-level plan covering:",
             "",
             "1. FEATURES — List every feature the app needs. Be specific:",
             "   - What does the user see on load?",
@@ -505,58 +572,41 @@ class LoopController:
             "   - What data does the app manage?",
             "   - What happens on each user action?",
             "",
-            "2. FILE STRUCTURE — List every file to create:",
+            "2. UI FLOW — For each action, describe the COMPLETE user flow:",
+            "   - Where is the button/trigger? (must be ALWAYS visible, not hidden in conditional sections)",
+            "   - What happens when clicked? (modal opens, form appears, etc.)",
+            "   - How does the user complete the action? (submit, cancel, etc.)",
+            "   - What state needs tracking? (e.g., which item is being edited)",
+            "   CRITICAL: The primary 'Add/Create' button must be in the header or toolbar,",
+            "   NOT only inside a welcome/empty-state message that disappears when items exist.",
+            "",
+            "3. FILE STRUCTURE:",
             "   - index.html — the main HTML file",
             "   - styles.css — all styling",
             "   - script.js — all JavaScript logic",
-            "   - Any additional files if needed",
             "",
-            "3. HTML PLAN — For index.html, describe:",
-            "   - Full page structure (header, main, sections, footer)",
-            "   - EVERY element with its tag, id attribute, and purpose",
-            "     Example: <form id=\"noteForm\"> — form for creating new notes",
-            "     Example: <input id=\"noteInput\" type=\"text\"> — text input for note content",
-            "     Example: <ul id=\"notesList\"> — list container for all notes",
-            "   - How elements are nested and grouped",
-            "   - Don't add any copyright or trademark symbols, all this projects are just for fun",
-            "   - Links to styles.css and script.js",
-            "",
-            "4. CSS PLAN — For styles.css, describe:",
-            "   - Layout approach (flexbox, grid, etc.)",
-            "   - Color scheme, fonts",
-            "   - Styling for each HTML element/ID listed above",
-            "   - Responsive breakpoints",
-            "   - Hover states, transitions, animations",
-            "   -  Spacing: no elements should touching each other directly (both vertical and horizontal)",
-            "   - Default should be fun and colorful design unless tone is specified by user prompt.",
-            "",
-            "5. JAVASCRIPT PLAN — For script.js, describe:",
-            "   - Data structures (arrays, objects) used to store app state",
-            "   - EVERY function name, its parameters, return value, and what it does",
-            "     Example: addNote(text) — creates a note object, adds to array, re-renders list",
-            "     Example: deleteNote(id) — removes note from array by id, re-renders",
-            "   - DOM references — which element IDs each function uses",
-            "   - Event listeners — which elements trigger which functions",
-            "   - Data persistence strategy (localStorage, etc.)",
-            "   - Module exports for testability",
-            "",
-            "6. CONNECTIONS — Describe how files reference each other:",
+            "4. CONNECTIONS — How files reference each other:",
             "   - HTML -> CSS: which classes/IDs CSS targets",
-            "   - HTML -> JS: which IDs JS queries with getElementById/querySelector",
+            "   - HTML -> JS: which IDs JS queries",
             "   - JS -> HTML: which elements JS creates or modifies dynamically",
             "",
-            "Be THOROUGH. The coding stage will rely entirely on this plan.",
+            "5. CLASS NAME CONTRACT — List the exact class names that will be shared:",
+            "   - State classes: hidden (for toggling visibility), active, disabled",
+            "   - Button classes: btn, btn-primary, btn-secondary, btn-danger, btn-edit, btn-delete",
+            "   - Dynamic element classes: e.g., note-card, note-card-header, note-card-body, note-card-actions",
+            "   - All three files (HTML, JS, CSS) MUST use these exact class names",
+            "",
+            "Be THOROUGH. All subsequent coding stages rely on this plan.",
             "Use plan_web_build to register the plan when done.",
             "Do NOT create any files yet.",
         ])
         return lines
 
-    def _build_existing_project_plan_prompt(
+    def _build_existing_project_feature_plan_prompt(
         self, task: str, workspace_state: dict[str, Any],
     ) -> list[str]:
-        """Build a planning prompt for an existing/populated project."""
+        """Build a feature planning prompt for an existing/populated project."""
         lines: list[str] = []
-
         lines.extend([
             f"Original request: {task}",
             "",
@@ -566,7 +616,7 @@ class LoopController:
             "Your job: study the existing code, understand the current state,",
             "then plan what changes or additions are needed.",
             "",
-            "Create a DETAILED plan covering:",
+            "Create a plan covering:",
             "",
             "1. CURRENT STATE ANALYSIS:",
             "   - What does the app currently do?",
@@ -577,98 +627,273 @@ class LoopController:
             "   - File name",
             "   - What specifically needs to change",
             "   - New elements, functions, or styles to add",
-            "   - Existing code to modify or remove",
             "",
-            "3. NEW FILES — If any new files are needed:",
-            "   - File name and purpose",
-            "   - Complete description of contents",
+            "3. NEW FILES — If any new files are needed",
             "",
-            "4. CONNECTIONS — How changes affect other files:",
-            "   - If adding HTML elements -> what CSS and JS needs updating?",
-            "   - If adding JS functions -> what HTML IDs do they reference?",
-            "   - If modifying CSS -> which HTML elements are affected?",
+            "4. CONNECTIONS — How changes affect other files",
             "",
-            "5. ELEMENT IDS AND REFERENCES:",
-            "   - List ALL element IDs (existing + new) after changes",
-            "   - Map each ID to the JS functions that use it",
-            "   - Map each ID to the CSS rules that style it",
-            "",
-            "Be THOROUGH. The coding stage will rewrite each file based on this plan.",
-            "Remember: every file you write in the code stage must be COMPLETE",
-            "(not just the changed parts).",
+            "Be THOROUGH. All subsequent coding stages rely on this plan.",
+            "Every file written later must be COMPLETE (not just changed parts).",
             "Use plan_web_build to register the plan when done.",
             "Do NOT create any files yet.",
         ])
         return lines
 
-    def _build_new_project_code_prompt(
-        self, task: str, created_files: set[str],
-    ) -> list[str]:
-        """Build the coding prompt for a new project."""
-        lines: list[str] = [
-            f"Task: {task}",
-            "",
-            "Now write ALL files based on your plan above.",
-            "Use create_file for EACH file. Write COMPLETE file contents.",
-            "",
-            "You MUST create all files in this single pass:",
-            "- index.html — complete HTML with all elements, IDs, links to CSS/JS",
-            "- styles.css — complete CSS targeting the exact IDs/elements from your HTML",
-            "- script.js — complete JS referencing the exact IDs from your HTML",
-            "- Any additional files described in your plan",
-            "",
-            "CRITICAL REQUIREMENTS:",
-            "- Every interactive HTML element MUST have a unique, descriptive id",
-            "- CSS must target IDs/classes that actually exist in your HTML",
-            "- JS must use getElementById/querySelector with IDs from your HTML",
-            "- Include <link rel=\"stylesheet\" href=\"styles.css\"> in HTML <head>",
-            "- Include <script src=\"script.js\"></script> before </body>",
-            "- JS: export pure logic functions via module.exports for testability",
-            "- Write ALL planned features — do not skip or simplify",
-            "",
-            "Call create_file once per file with the FULL contents.",
-        ]
-        return lines
+    # ------------------------------------------------------------------
+    # HTML code prompt
+    # ------------------------------------------------------------------
 
-    def _build_existing_project_code_prompt(
+    def _build_html_code_prompt(
         self,
         task: str,
+        general_plan: str,
         created_files: set[str],
         workspace_state: dict[str, Any],
+        skill_text: str,
     ) -> list[str]:
-        """Build the coding prompt for an existing project."""
-        # Inject current file contents so the model has full context
-        file_snippets = self._read_created_files(
-            created_files, extensions={".html", ".css", ".js", ".json"},
-        )
+        """Build the HTML coding prompt with general plan + skill guide + existing HTML."""
+        lines: list[str] = []
 
-        lines: list[str] = [
-            f"Task: {task}",
-            "",
-        ]
-
-        if file_snippets:
+        # Inject general plan
+        if general_plan:
             lines.extend([
-                "=== CURRENT FILE CONTENTS (for reference) ===",
-                file_snippets,
-                "=== END FILE CONTENTS ===",
+                "=== GENERAL PLAN (from previous stage) ===",
+                general_plan,
+                "=== END GENERAL PLAN ===",
                 "",
             ])
 
+        # Inject HTML skill guide
+        if skill_text:
+            lines.extend([
+                "=== HTML SKILL GUIDE ===",
+                skill_text,
+                "=== END HTML SKILL GUIDE ===",
+                "",
+            ])
+
+        # For existing projects, include current HTML for reference
+        if not workspace_state["is_empty"]:
+            html_content = self._read_created_files(
+                created_files, extensions={".html"},
+            )
+            if html_content:
+                lines.extend([
+                    "=== CURRENT HTML (existing file — rewrite completely) ===",
+                    html_content,
+                    "=== END CURRENT HTML ===",
+                    "",
+                ])
+
         lines.extend([
-            "Now write ALL files that need creating or updating based on your plan.",
-            "Use create_file for EACH file. Write COMPLETE file contents.",
+            f"Task: {task}",
             "",
-            "IMPORTANT:",
-            "- When modifying an existing file, write the ENTIRE file (not just changes).",
-            "- Include all existing working code plus your modifications.",
-            "- Maintain all existing element IDs, classes, and function names",
-            "  unless your plan specifically calls for changing them.",
-            "- CSS must target IDs/classes that actually exist in the HTML.",
-            "- JS must reference IDs that actually exist in the HTML.",
-            "- Include proper stylesheet and script links in HTML.",
+            "Write the COMPLETE index.html file.",
+            "Use create_file to write the full file.",
             "",
-            "Call create_file once per file with the FULL contents.",
+            "REQUIREMENTS:",
+            "- Follow the HTML Skill Guide above for structure and naming conventions",
+            "- Every interactive element MUST have a unique, descriptive id (kebab-case)",
+            "- Use semantic HTML5 (<header>, <main>, <section>, <form>, <footer>)",
+            "- Include <link rel=\"stylesheet\" href=\"styles.css\"> in <head>",
+            "- Include <script src=\"script.js\"></script> before </body>",
+            "- Write the COMPLETE file, not partial snippets",
+            "- Implement ALL features from the general plan",
+            "",
+            "CROSS-FILE CONTRACT (Critical):",
+            "- Elements that start hidden MUST have class='hidden' (e.g., modals: class='modal-overlay hidden')",
+            "- Use standard button classes: btn, btn-primary, btn-secondary, btn-danger",
+            "- Add an HTML comment documenting the dynamic element template (class names JS will use)",
+            "- All class names defined here will be referenced by JS and styled by CSS",
+            "- The primary Add/Create button MUST be in the header or a persistent toolbar,",
+            "  NOT only inside a welcome/empty-state section that disappears when items exist",
+            "",
+            "Call create_file with relative_path='index.html' and the full HTML content.",
+        ])
+        return lines
+
+    # ------------------------------------------------------------------
+    # JS code prompt
+    # ------------------------------------------------------------------
+
+    def _build_js_code_prompt(
+        self,
+        task: str,
+        general_plan: str,
+        created_files: set[str],
+        workspace_state: dict[str, Any],
+        skill_text: str,
+    ) -> list[str]:
+        """Build the JS coding prompt with general plan + skill guide + completed HTML + existing JS."""
+        lines: list[str] = []
+
+        # Inject general plan
+        if general_plan:
+            lines.extend([
+                "=== GENERAL PLAN (from previous stage) ===",
+                general_plan,
+                "=== END GENERAL PLAN ===",
+                "",
+            ])
+
+        # Inject JS skill guide
+        if skill_text:
+            lines.extend([
+                "=== JAVASCRIPT SKILL GUIDE ===",
+                skill_text,
+                "=== END JAVASCRIPT SKILL GUIDE ===",
+                "",
+            ])
+
+        # Include completed HTML so JS references exact IDs
+        html_content = self._read_created_files(
+            created_files, extensions={".html"},
+        )
+        if html_content:
+            lines.extend([
+                "=== COMPLETED HTML (reference element IDs from this) ===",
+                html_content,
+                "=== END COMPLETED HTML ===",
+                "",
+            ])
+
+        # For existing projects, include current JS for reference
+        if not workspace_state["is_empty"]:
+            js_content = self._read_created_files(
+                created_files, extensions={".js"},
+            )
+            if js_content:
+                lines.extend([
+                    "=== CURRENT JS (existing file — rewrite completely) ===",
+                    js_content,
+                    "=== END CURRENT JS ===",
+                    "",
+                ])
+
+        lines.extend([
+            f"Task: {task}",
+            "",
+            "Write the COMPLETE script.js file.",
+            "Use create_file to write the full file.",
+            "",
+            "REQUIREMENTS:",
+            "- Follow the JavaScript Skill Guide above",
+            "- Reference the EXACT element IDs from the completed HTML above",
+            "- Separate pure logic into named functions",
+            "- Check elements exist before using them (null safety)",
+            "- Use DOMContentLoaded event listener",
+            "- Write the COMPLETE file, not partial snippets",
+            "",
+            "CROSS-FILE CONTRACT (Critical):",
+            "- Use ONLY 'hidden' class for visibility toggling (classList.add/remove)",
+            "- NEVER use 'is-open', 'show', 'visible', or any other toggle class",
+            "- When creating dynamic elements, use EXACT class names from the HTML template",
+            "- Use standard button classes: btn, btn-primary, btn-secondary, btn-danger, btn-edit, btn-delete",
+            "- Do NOT invent new class names that are not in the HTML",
+            "- For edit flows: track which item is being edited with a module-level variable (let currentEditId = null)",
+            "  Do NOT rely on form.dataset unless you explicitly set it when opening the edit modal",
+            "- Do NOT use escapeHtml() when setting input.value or textarea.value (plain text, not HTML)",
+            "  Only use escapeHtml() inside innerHTML or template literals",
+            "",
+            "Call create_file with relative_path='script.js' and the full JS content.",
+        ])
+        return lines
+
+    # ------------------------------------------------------------------
+    # CSS code prompt
+    # ------------------------------------------------------------------
+
+    def _build_css_code_prompt(
+        self,
+        task: str,
+        general_plan: str,
+        created_files: set[str],
+        workspace_state: dict[str, Any],
+        skill_text: str,
+    ) -> list[str]:
+        """Build the CSS coding prompt with general plan + skill guide + completed HTML + completed JS + existing CSS."""
+        lines: list[str] = []
+
+        # Inject general plan
+        if general_plan:
+            lines.extend([
+                "=== GENERAL PLAN (from previous stage) ===",
+                general_plan,
+                "=== END GENERAL PLAN ===",
+                "",
+            ])
+
+        # Inject CSS skill guide
+        if skill_text:
+            lines.extend([
+                "=== CSS SKILL GUIDE ===",
+                skill_text,
+                "=== END CSS SKILL GUIDE ===",
+                "",
+            ])
+
+        # Include completed HTML so CSS targets exact elements
+        html_content = self._read_created_files(
+            created_files, extensions={".html"},
+        )
+        if html_content:
+            lines.extend([
+                "=== COMPLETED HTML (target selectors from this) ===",
+                html_content,
+                "=== END COMPLETED HTML ===",
+                "",
+            ])
+
+        # Include completed JS so CSS can see what classes JS toggles and creates
+        js_content = self._read_created_files(
+            created_files, extensions={".js"},
+        )
+        if js_content:
+            lines.extend([
+                "=== COMPLETED JS (style every class name used here) ===",
+                js_content,
+                "=== END COMPLETED JS ===",
+                "",
+            ])
+
+        # For existing projects, include current CSS for reference
+        if not workspace_state["is_empty"]:
+            css_content = self._read_created_files(
+                created_files, extensions={".css"},
+            )
+            if css_content:
+                lines.extend([
+                    "=== CURRENT CSS (existing file — rewrite completely) ===",
+                    css_content,
+                    "=== END CURRENT CSS ===",
+                    "",
+                ])
+
+        lines.extend([
+            f"Task: {task}",
+            "",
+            "Write the COMPLETE styles.css file.",
+            "Use create_file to write the full file.",
+            "",
+            "REQUIREMENTS:",
+            "- Follow the CSS Skill Guide above",
+            "- Target the EXACT IDs, classes, and elements from the completed HTML",
+            "- Style EVERY class name that appears in the completed JS (dynamic elements)",
+            "- Do NOT invent selectors for elements that don't exist",
+            "- Include responsive design and clean typography",
+            "- Use flexbox/grid for layout",
+            "- Default should be fun and colorful design unless tone is specified",
+            "- Write the COMPLETE file, not partial snippets",
+            "",
+            "CROSS-FILE CONTRACT (Critical):",
+            "- MUST define: .hidden { display: none !important; }",
+            "- MUST style all button classes: .btn, .btn-primary, .btn-secondary, .btn-danger, .btn-edit, .btn-delete",
+            "- MUST style all dynamic element classes from JS (e.g., .note-card, .note-card-header, etc.)",
+            "- MUST style .modal-overlay and .modal-content",
+            "- Do NOT define .is-open, .is-hidden, or any non-standard toggle classes",
+            "- Every class in HTML and JS must have a corresponding CSS rule",
+            "",
+            "Call create_file with relative_path='styles.css' and the full CSS content.",
         ])
         return lines
 

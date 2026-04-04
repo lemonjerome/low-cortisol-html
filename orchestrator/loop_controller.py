@@ -990,14 +990,16 @@ class LoopController:
             memory.add("user", prompt)
 
             num_predict = _env_int("ORCHESTRATOR_CODE_NUM_PREDICT", 16384)
+            test_slim = self._slim_context_for_call(memory)
+            test_ctx = self._needed_num_ctx(test_slim, stage_tools, num_predict)
             try:
-                print("[status:agent] calling model...", file=sys.stderr, flush=True)
+                print(f"[status:agent] calling model... (num_ctx={test_ctx})", file=sys.stderr, flush=True)
                 response = self.ollama_client.chat(
                     model=self.model_name,
-                    messages=memory.messages,
+                    messages=test_slim,
                     tools=stage_tools,
                     stream=False,
-                    num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 40000),
+                    num_ctx=test_ctx,
                     num_predict=num_predict,
                 )
                 message = self.ollama_client.extract_assistant_message(response)
@@ -1010,10 +1012,10 @@ class LoopController:
                     try:
                         response = self.ollama_client.chat(
                             model=self.model_name,
-                            messages=memory.messages,
+                            messages=test_slim,
                             tools=[],
                             stream=False,
-                            num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 32768),
+                            num_ctx=test_ctx,
                             num_predict=num_predict,
                         )
                         message = self.ollama_client.extract_assistant_message(response)
@@ -1303,14 +1305,21 @@ class LoopController:
         On unrecoverable error returns ("", []).
         """
         slim_messages = self._slim_context_for_call(memory)
+        # Compute the minimum num_ctx needed for this call. Requesting the full
+        # 200k regardless of payload size is the primary cause of HTTP 500s on
+        # shared Ollama Cloud instances — large KV-cache allocations OOM the server.
+        num_ctx = self._needed_num_ctx(slim_messages, stage_tools, num_predict)
         try:
-            print("[status:agent] calling model...", file=sys.stderr, flush=True)
+            print(
+                f"[status:agent] calling model... (num_ctx={num_ctx})",
+                file=sys.stderr, flush=True,
+            )
             response = self.ollama_client.chat(
                 model=self.model_name,
                 messages=slim_messages,
                 tools=stage_tools,
                 stream=False,
-                num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 200000),
+                num_ctx=num_ctx,
                 num_predict=num_predict,
             )
             message = self.ollama_client.extract_assistant_message(response)
@@ -1327,7 +1336,7 @@ class LoopController:
                         messages=slim_messages,
                         tools=[],
                         stream=False,
-                        num_ctx=_env_int("ORCHESTRATOR_AGENT_NUM_CTX", 200000),
+                        num_ctx=num_ctx,
                         num_predict=num_predict,
                     )
                     message = self.ollama_client.extract_assistant_message(response)
@@ -1353,11 +1362,14 @@ class LoopController:
                         "content": "[PLAN.md — project reference]\n" + plan_content,
                     })
                 try:
+                    retry_messages = system_msgs + plan_msgs + recent_msgs
+                    retry_ctx = self._needed_num_ctx(retry_messages, stage_tools, num_predict)
                     response = self.ollama_client.chat(
                         model=self.model_name,
-                        messages=system_msgs + plan_msgs + recent_msgs,
+                        messages=retry_messages,
                         tools=stage_tools,
                         stream=False,
+                        num_ctx=retry_ctx,
                         num_predict=num_predict,
                     )
                     message = self.ollama_client.extract_assistant_message(response)
@@ -1517,6 +1529,10 @@ class LoopController:
                                 self._write_plan_md(general_plan_text, created_files)
                             elif rel == "styles.css":
                                 self._write_plan_md(general_plan_text, created_files)
+                        # Scrub file content from memory once written — it's on disk,
+                        # refs are in PLAN.md. Keeping 8-15k chars per file in tool_call
+                        # args is the biggest source of KV-cache bloat across stages.
+                        self._scrub_create_file_content(memory, rel)
 
                 # feature_plan done when plan_web_build is called
                 if stage_name == "feature_plan" and name == "plan_web_build":
@@ -2281,13 +2297,21 @@ class LoopController:
     def _compact_memory(self, memory: SessionMemory) -> None:
         """Compact memory if it exceeds the character budget.
 
+        Counts all message data including tool_call arguments (where create_file
+        stores full file content). Always truncates large tool results first
+        (cheap, non-destructive). Then summarises the middle of the conversation
+        if still over budget — replacing verbose messages with a structured summary.
+
         Structured extraction preserves meaningful decision state:
         - Which files were created and which tools were called
         - Key reasoning snippets (first line of each assistant turn)
         - Stage prompt labels (not full content)
         """
+        # Always truncate large tool results first — cheapest, safest reduction
+        self._truncate_tool_results(memory)
+
         budget = _env_int("ORCHESTRATOR_MEMORY_CHAR_BUDGET", CONTEXT_SOFT_BUDGET_CHARS)
-        total = sum(len(str(m.get("content", ""))) + 50 for m in memory.messages)
+        total = self._count_message_chars(memory.messages)
         if total <= budget:
             return
 
@@ -2358,6 +2382,99 @@ class LoopController:
         memory.messages = [*head, {"role": "user", "content": "\n".join(lines)}, *tail]
 
     # ------------------------------------------------------------------
+    # Context measurement helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _count_message_chars(messages: list[dict[str, Any]]) -> int:
+        """Count characters across all message fields including tool_calls arguments.
+
+        The content field alone understates actual size because create_file stores
+        the full file in tool_call arguments, not in content.
+        """
+        total = 0
+        for m in messages:
+            total += len(str(m.get("content") or ""))
+            for tc in m.get("tool_calls") or []:
+                args = tc.get("arguments") or tc.get("function", {}).get("arguments") or {}
+                if isinstance(args, dict):
+                    total += sum(len(str(v)) for v in args.values())
+                else:
+                    total += len(str(args))
+        return total
+
+    def _needed_num_ctx(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        num_predict: int,
+    ) -> int:
+        """Compute the minimum num_ctx needed for this call.
+
+        Claude Code allocates only what is required for the actual payload — not
+        a fixed 200k regardless of input. Requesting excess VRAM causes HTTP 500s
+        on shared Ollama Cloud instances.
+
+        Formula: (message chars + tool schema chars) / 3 chars-per-token
+                 + num_predict output tokens + 20% overhead
+        Clamps to [8192, 131072] and rounds to the nearest 8192.
+        """
+        msg_chars = self._count_message_chars(messages)
+        tool_chars = sum(len(json.dumps(t)) for t in tools)
+        input_tokens = (msg_chars + tool_chars) // 3
+        needed = int((input_tokens + num_predict) * 1.2) + 1024
+        clamped = max(8192, min(131072, needed))
+        rounded = ((clamped + 8191) // 8192) * 8192
+        return rounded
+
+    def _scrub_create_file_content(self, memory: SessionMemory, path: str) -> None:
+        """Replace create_file content arg in memory with a one-line stub.
+
+        Once a file is verified written, its full content in the tool_call args
+        is the largest source of context bloat across subsequent stages.
+        The file is safe on disk and refs are in PLAN.md — we don't need it
+        in the KV cache. This is the Claude Code 'forget transient outputs
+        once verification succeeds' pattern.
+        """
+        for msg in reversed(memory.messages):
+            if msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                tc_name = tc.get("name") or tc.get("function", {}).get("name", "")
+                if tc_name != "create_file":
+                    continue
+                args = tc.get("arguments") or tc.get("function", {}).get("arguments") or {}
+                if not isinstance(args, dict):
+                    continue
+                if args.get("relative_path") == path:
+                    original_len = len(str(args.get("content", "")))
+                    if original_len > 200:
+                        args["content"] = (
+                            f"[scrubbed: {original_len} chars — "
+                            f"{path} written to disk, refs in PLAN.md]"
+                        )
+                    return  # only scrub the most-recent write of this path
+
+    def _truncate_tool_results(self, memory: SessionMemory, max_chars: int = 600) -> None:
+        """Trim large tool result messages to head + tail (600 chars default).
+
+        read_file outputs can be thousands of chars. Once the agent has acted
+        on the content, the verbatim text is noise. Keep enough context to
+        understand what was read; discard the rest. Mirrors Claude Code's
+        'extract specific error messages, discard fluff' strategy.
+        """
+        for msg in memory.messages:
+            if msg.get("role") != "tool":
+                continue
+            content = str(msg.get("content") or "")
+            if len(content) <= max_chars:
+                continue
+            head = content[:300]
+            tail = content[-200:]
+            trimmed_chars = len(content) - 500
+            msg["content"] = head + f"\n... [{trimmed_chars} chars trimmed] ...\n" + tail
+
+    # ------------------------------------------------------------------
     # Context slimming — keeps full memory object, returns trimmed call list
     # ------------------------------------------------------------------
 
@@ -2370,7 +2487,7 @@ class LoopController:
 
         The memory object itself is NOT modified — this only affects what is sent to the API.
         """
-        total_chars = sum(len(str(m.get("content", ""))) for m in memory.messages)
+        total_chars = self._count_message_chars(memory.messages)
 
         if total_chars <= CONTEXT_SOFT_BUDGET_CHARS:
             return memory.messages

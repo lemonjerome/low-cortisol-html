@@ -248,14 +248,12 @@ def ensure_workspace_name(name: str) -> str:
         raise ValueError("Workspace name is required")
     if "/" in trimmed or "\\" in trimmed:
         raise ValueError("Workspace name must not include path separators")
-    if not trimmed.startswith(WORKSPACE_PREFIX):
-        raise ValueError("Warning: Workspace directory must start with 'lch_'")
     return trimmed
 
 
 def ensure_prefixed_directory_name(path_value: Path, *, label: str) -> None:
-    if not path_value.name.startswith(WORKSPACE_PREFIX):
-        raise ValueError(f"Warning: {label} must start with 'lch_'")
+    # Prefix requirement removed — any folder name is allowed
+    pass
 
 
 def summarize_structure(root: Path, *, max_entries: int = 120) -> str:
@@ -838,9 +836,7 @@ class UiHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/open-project":
                 payload = read_json(self)
                 requested = validate_absolute_dir(str(payload.get("projectPath", "")).strip())
-                name = requested.name
-                if not name.startswith(WORKSPACE_PREFIX):
-                    raise ValueError("Warning: Only folders starting with 'lch_' can be opened")
+                name = requested.name  # noqa: F841 — validation only
                 with STATE.lock:
                     STATE.current_project = requested
                     STATE.project_structure_summary = summarize_structure(requested)

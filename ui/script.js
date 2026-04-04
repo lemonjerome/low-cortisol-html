@@ -355,7 +355,7 @@ async function _loadProjectPicker() {
     const res = await fetch("/api/browse-dir?path=" + encodeURIComponent(state.currentWorkspacesRoot || ""));
     const data = await res.json();
     if (!data.ok) { errEl.textContent = data.error || "Could not read lch_workspaces"; listEl.innerHTML = ""; return; }
-    const dirs = data.entries.filter(e => e.is_dir && e.name.startsWith("lch_"));
+    const dirs = data.entries.filter(e => e.is_dir && !e.name.startsWith("."));
     listEl.innerHTML = "";
     if (dirs.length === 0) {
       listEl.innerHTML = '<div class="project-picker-empty">No projects found.<br>Use <strong>New Project</strong> to create one.</div>';
@@ -570,10 +570,28 @@ document.getElementById("tutorialGotIt").addEventListener("click", () => {
   hideModal("tutorialModal");
 });
 
+function slugifyProjectName(raw) {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")          // spaces → hyphens
+    .replace(/[^a-z0-9._-]/g, "") // strip anything not safe in a folder name
+    .replace(/^-+|-+$/g, "");     // trim leading/trailing hyphens
+}
+
 document.getElementById("newProjectBtn").addEventListener("click", () => {
-  document.getElementById("newWorkspaceName").value = "";
+  const input = document.getElementById("newWorkspaceName");
+  const hint = document.getElementById("newProjectNameHint");
+  input.value = "";
+  hint.textContent = "";
   document.getElementById("newProjectError").textContent = "";
   showModal("newProjectModal");
+});
+
+document.getElementById("newWorkspaceName").addEventListener("input", () => {
+  const hint = document.getElementById("newProjectNameHint");
+  const slug = slugifyProjectName(document.getElementById("newWorkspaceName").value);
+  hint.textContent = slug ? "Folder name: " + slug : "";
 });
 
 document.getElementById("newProjectCancel").addEventListener("click", () => hideModal("newProjectModal"));
@@ -582,10 +600,9 @@ document.getElementById("newProjectCreate").addEventListener("click", async () =
   const errorEl = document.getElementById("newProjectError");
   errorEl.textContent = "";
   try {
-    const rawName = document.getElementById("newWorkspaceName").value.trim();
-    if (!rawName) throw new Error("Please enter a project name.");
-    // Auto-prepend lch_ prefix so the user doesn't have to type it
-    const workspaceName = rawName.startsWith("lch_") ? rawName : "lch_" + rawName;
+    const rawName = document.getElementById("newWorkspaceName").value;
+    const workspaceName = slugifyProjectName(rawName);
+    if (!workspaceName) throw new Error("Please enter a project name.");
     await apiPost("/api/create-project", {
       parentDir: state.currentWorkspacesRoot,
       workspaceName,

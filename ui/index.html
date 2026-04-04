@@ -50,7 +50,8 @@
         <h3>New Project</h3>
         <p class="modal-subtext">Enter a name for your project.</p>
         <label class="field-label">Project name</label>
-        <input id="newWorkspaceName" type="text" placeholder="my-app" />
+        <input id="newWorkspaceName" type="text" placeholder="my app" autocomplete="off" />
+        <p class="field-hint" id="newProjectNameHint"></p>
         <div class="modal-actions">
           <button id="newProjectCancel" class="btn">Cancel</button>
           <button id="newProjectCreate" class="btn primary">Create</button>
@@ -119,8 +120,8 @@
           <div class="tutorial-section-title">Header buttons</div>
           <ul class="tutorial-list">
             <li><strong>Open HTML</strong> — opens the generated <code>index.html</code> in a new tab via the local server.</li>
-            <li><strong>New Project</strong> — creates a new empty workspace folder inside <code>lch_workspaces</code> on your Desktop.</li>
-            <li><strong>Open Project</strong> — loads an existing <code>lch_</code> project folder so the agent can read and edit it.</li>
+            <li><strong>New Project</strong> — creates a new empty workspace folder inside <code>lch_workspaces</code>.</li>
+            <li><strong>Open Project</strong> — loads an existing project folder so the agent can read and edit it.</li>
             <li><strong>Clear Chat</strong> — resets the in-memory conversation context (does not delete files).</li>
             <li><strong>?</strong> — opens this tutorial.</li>
           </ul>
@@ -131,8 +132,7 @@
           <ul class="tutorial-list">
             <li>The agent detects whether the workspace is empty or has existing files and adjusts its approach.</li>
             <li>Be specific — describe colours, layout, and interactions you want.</li>
-            <li>Workspace folders must start with <code>lch_</code> — this keeps them organised in <code>lch_workspaces</code>.</li>
-            <li>All projects are stored in <code>lch_workspaces</code> on your Desktop, mirrored into the container.</li>
+            <li>All projects are stored in the <code>lch_workspaces</code> folder, mirrored into the container.</li>
           </ul>
         </div>
 

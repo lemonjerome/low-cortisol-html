@@ -84,59 +84,50 @@ STAGE_PRIMARY_FILE: dict[str, str] = {
 CONTEXT_SOFT_BUDGET_CHARS = 600_000   # ~200k tokens — normal compaction trigger
 CONTEXT_HARD_BUDGET_CHARS = 750_000   # ~250k tokens — emergency slim trigger
 
-SYSTEM_PROMPT = (
-    "You are a frontend coding agent that builds HTML/CSS/JS web apps.\n"
-    "You work in sequential stages: plan features, write HTML, write JS, write CSS.\n"
-    "Each stage focuses on ONE task. Follow the skill guides provided.\n"
-    "\n"
-    "REASONING AND ACTING (ReAct):\n"
-    "- Each stage allows multiple turns. Use them wisely.\n"
-    "- First turn: reason about what you need to know. Call read_file, search_files,\n"
-    "  or list_directory to explore and understand the workspace before writing.\n"
-    "- Subsequent turns: you will see tool results in context. Continue reasoning,\n"
-    "  call more tools if needed, or write the final output file.\n"
-    "- When you are ready to produce the output, call create_file with the\n"
-    "  COMPLETE file content. Do not call create_file with partial content.\n"
-    "- When you have nothing more to do in a stage, produce text output only\n"
-    "  (no tool calls). This signals the end of the stage.\n"
-    "- If a tool returns an error, adapt: try a different path or approach.\n"
-    "\n"
-    "CRITICAL RULES:\n"
-    "- Use RELATIVE paths only (e.g. 'index.html', 'styles.css', 'script.js').\n"
-    "  NEVER use absolute paths like /root/Desktop/... or /home/user/...\n"
-    "- The planning stage: reason about what to build. Be thorough.\n"
-    "- Coding stages: use the create_file tool to write COMPLETE file contents.\n"
-    "  Each coding stage writes exactly ONE file. The file must be complete.\n"
-    "- Always generate code that matches the planned features exactly.\n"
-    "- Keep reasoning in plain text, no JSON envelopes.\n"
-    "- Do NOT prefix lines with 'type=reason' or 'type=signal'.\n"
-    "- Use only the tools provided for each stage.\n"
-    "- For create_file: always write the full file, not partial snippets.\n"
-    "\n"
-    "CROSS-FILE CLASS NAME CONTRACT (Critical):\n"
-    "- HTML is the source of truth for all IDs and class names.\n"
-    "- JS must reference ONLY IDs and classes that exist in the HTML.\n"
-    "- CSS must style ONLY IDs and classes that exist in the HTML.\n"
-    "- The ONLY state classes for toggling visibility are: hidden, active, disabled.\n"
-    "- NEVER use: is-open, is-hidden, is-visible, show, visible, open, closed.\n"
-    "- Modals start with class='hidden' in HTML. JS removes 'hidden' to show.\n"
-    "- CSS must always define: .hidden { display: none !important; }\n"
-    "- When JS creates dynamic elements, it must use class names that CSS styles.\n"
-    "- All three files must agree on every class name. No mismatches.\n"
-)
+SYSTEM_PROMPT = """\
+==================== PRIMACY (READ FIRST) ====================
+
+## [ROLE]
+You are an expert frontend coding agent specialising in HTML, CSS, and vanilla JavaScript.
+You build complete, working single-page web apps. You are methodical, precise, and
+follow skill guides exactly. You never guess at IDs, class names, or file structures.
+
+## [CORE RULES]
+- Use RELATIVE paths only: 'index.html', 'styles.css', 'script.js'. Never absolute.
+- Write COMPLETE files with create_file — never partial snippets or placeholders.
+- Do NOT hallucinate element IDs, class names, or function names. Use only what is defined.
+- Read PLAN.md first when it exists — it has cross-file references and build status.
+- Keep reasoning concise and in plain text. No JSON wrappers, no type=reason prefixes.
+- Use only the tools provided for each stage.
+
+## [REASONING STRATEGY — ReAct]
+- Each stage runs multiple turns. Plan → explore → act.
+- Turn 1: reason about the task. If a PLAN.md exists, read it. Explore sparingly.
+- Later turns: build on tool results. Call create_file when you have what you need.
+- Do NOT re-read files already visible in this conversation — they are in context.
+- If a tool returns an error: adapt. Do not repeat the same failing call.
+- Signal stage done by returning plain text only (zero tool calls).
+
+## [OUTPUT FORMAT]
+- Reasoning: plain text, concise. One create_file call per stage.
+- File content: complete — every line, every tag, every function, no TODO stubs.
+- After writing the file: short plain-text confirmation. No further tool calls.
+
+## [GLOBAL CONSTRAINTS — Cross-File Class Contract]
+- HTML is the single source of truth for all element IDs and class names.
+- JS queries ONLY IDs that exist in the HTML.
+- CSS styles ONLY classes from HTML and JS dynamic element creation.
+- ONLY three visibility toggle classes are allowed: hidden · active · disabled
+  BANNED: is-open  is-hidden  is-visible  show  visible  open  closed  is-active
+- Modals: start with class='hidden' in HTML. JS calls classList.remove('hidden') to show.
+- CSS MUST include: .hidden { display: none !important; }
+- All three files must agree on every class name. Zero mismatches.
+
+==================== END PRIMACY ====================
+"""
 
 
-# Appended to the end of every coding stage prompt (html_code, js_code, css_code).
-# Position-aware: placing critical rules at the END improves recall vs. burying them mid-prompt.
-STAGE_TAIL_REMINDER = (
-    "\n---\n"
-    "CRITICAL STAGE COMPLETION REQUIREMENTS (read this last):\n"
-    "- Call create_file with the COMPLETE file content. Never partial — the full file.\n"
-    "- State toggle classes: ONLY `hidden`, `active`, `disabled`. Never `is-open`, `is-hidden`, `show`, `visible`.\n"
-    "- CSS must always define: `.hidden { display: none !important; }`\n"
-    "- JS must reference ONLY IDs and classes that exist in the HTML.\n"
-    "- When you have written the file, produce plain text only to end the stage (no more tool calls).\n"
-)
+# Recency zone is built per-stage by LoopController._build_recency_zone().
 
 
 def _env_int(name: str, default: int) -> int:
@@ -214,6 +205,10 @@ class LoopController:
         self._plan_html_refs: dict[str, Any] = {}
         self._plan_js_classes: list[str] = []
 
+        # Chat history tracking for CHAT.md compression
+        self._stage_summaries: list[dict[str, Any]] = []
+        self._current_stage_info: dict[str, Any] = {}
+
     # ------------------------------------------------------------------
     # Workspace detection
     # ------------------------------------------------------------------
@@ -277,6 +272,8 @@ class LoopController:
         self._pipeline_task = task
         self._plan_html_refs = {}
         self._plan_js_classes = []
+        self._stage_summaries = []
+        self._current_stage_info = {}
 
         memory = SessionMemory()
         memory.add("system", SYSTEM_PROMPT)
@@ -362,6 +359,12 @@ class LoopController:
             print(f"[status:agent] stage: {stage_name}", file=sys.stderr, flush=True)
             stage_label = stage_name.replace("_", " ").title()
             self._emit_reasoning(stage_name, f"Starting stage: {stage_label}")
+            self._current_stage_info = {
+                "stage": stage_name,
+                "nudges": 0,
+                "errors": [],
+                "primary_written": False,
+            }
 
             # Build stage prompt with appropriate context
             stage_prompt = self._build_stage_prompt(
@@ -405,6 +408,16 @@ class LoopController:
                 base_iteration=iteration,
                 general_plan_text=general_plan_text,
             )
+            # Record stage outcome in CHAT.md
+            primary_file = STAGE_PRIMARY_FILE.get(stage_name)
+            self._current_stage_info["primary_written"] = bool(
+                primary_file and primary_file in created_files
+            )
+            if stage_name == "feature_plan":
+                snippet = general_plan_text.strip().split("\n")[0][:200] if general_plan_text else ""
+                self._current_stage_info["reasoning_summary"] = snippet
+            self._stage_summaries.append(dict(self._current_stage_info))
+            self._write_chat_md(created_files)
 
         # --- Run test stage (write tests, run, fix, loop until passing) ---
         iteration = self._run_test_stage(
@@ -487,6 +500,103 @@ class LoopController:
 
     # ------------------------------------------------------------------
     # Feature plan prompts
+    # ------------------------------------------------------------------
+    # Recency zone builder
+    # ------------------------------------------------------------------
+
+    def _build_recency_zone(self, *, stage_name: str) -> list[str]:
+        """Build the RECENCY zone appended at the END of each coding stage prompt.
+
+        Position-aware design: the most critical per-stage rules live here, at the
+        bottom of the context window where attention recall is highest (85–95%).
+        Follows: Current Task → Focus → Constraints → Action → Format → Checklist.
+        """
+        primary_file = STAGE_PRIMARY_FILE.get(stage_name, "output file")
+        lines = [
+            "",
+            "==================== RECENCY (READ LAST) ====================",
+            "",
+            "## [CURRENT TASK]",
+            f"Stage: {stage_name}",
+            f"Deliverable: `{primary_file}` — write the COMPLETE file with create_file.",
+            "",
+            "## [FOCUS INSTRUCTIONS]",
+            "- Call read_file 'PLAN.md' if you need cross-file references (IDs, classes, build status).",
+            "- Use the skill guide above for required patterns and anti-patterns.",
+            "- Do NOT re-read files whose content is already visible in this conversation.",
+        ]
+
+        if stage_name == "html_code":
+            lines += [
+                "- Add/Create button MUST be in a persistent header — not only in empty-state sections.",
+                "- Modals: id='...' class='modal-overlay hidden' (starts hidden).",
+            ]
+        elif stage_name == "js_code":
+            lines += [
+                "- PLAN.md > HTML Element Reference has every ID your JS needs — use it.",
+                "- Track edit state with a module-level variable: let currentEditId = null;",
+            ]
+        elif stage_name == "css_code":
+            lines += [
+                "- PLAN.md > JS Dynamic Classes lists every dynamic class you must style.",
+                "- PLAN.md > HTML Element Reference lists selectors to target.",
+            ]
+
+        lines += [
+            "",
+            "## [CONSTRAINTS REPEATED]",
+            "- Visibility toggles: ONLY `hidden` / `active` / `disabled`. Nothing else.",
+            "- No inline styles. No inventing new class names not in the HTML.",
+        ]
+
+        if stage_name == "css_code":
+            lines += [
+                "- MUST define: .hidden { display: none !important; }",
+                "- MUST style every class listed under PLAN.md > JS Dynamic Classes.",
+            ]
+        elif stage_name == "js_code":
+            lines += [
+                "- Only use hidden/active/disabled for classList toggling.",
+                "- escapeHtml() for innerHTML only — NOT for input.value or textarea.value.",
+            ]
+
+        lines += [
+            "",
+            "## [ACTION INSTRUCTIONS]",
+            "1. Read PLAN.md if you need element IDs or class references (call read_file 'PLAN.md').",
+            f"2. Call create_file with relative_path='{primary_file}' and the COMPLETE file content.",
+            "3. Return plain text only after writing — this signals end of stage.",
+            "",
+            "## [OUTPUT FORMAT REPEATED]",
+            f"- Exactly ONE create_file call with the complete {primary_file}.",
+            "- Short plain-text confirmation afterward. No more tool calls.",
+            "",
+            "## [CHECKLIST]",
+            "- [ ] File is complete — no TODO stubs, no partial snippets",
+            "- [ ] All IDs and classes match what is in the HTML exactly",
+            "- [ ] Only hidden / active / disabled used for visibility toggling",
+        ]
+
+        if stage_name == "css_code":
+            lines += [
+                "- [ ] .hidden { display: none !important; } is defined",
+                "- [ ] Every JS dynamic class has a corresponding CSS rule",
+            ]
+        elif stage_name == "js_code":
+            lines += [
+                "- [ ] currentEditId module-level variable used for edit state tracking",
+                "- [ ] escapeHtml() only on innerHTML, never on input/textarea values",
+            ]
+        elif stage_name == "html_code":
+            lines += [
+                "- [ ] Persistent Add/Create button exists in the header",
+                "- [ ] Modals have class='modal-overlay hidden'",
+                "- [ ] Every interactive element has a unique descriptive id",
+            ]
+
+        lines += ["", "==================== END RECENCY ===================="]
+        return lines
+
     # ------------------------------------------------------------------
 
     def _build_new_project_feature_plan_prompt(self, task: str) -> list[str]:
@@ -650,9 +760,8 @@ class LoopController:
             "- The primary Add/Create button MUST be in the header or a persistent toolbar,",
             "  NOT only inside a welcome/empty-state section that disappears when items exist",
             "",
-            "Call create_file with relative_path='index.html' and the full HTML content.",
-            STAGE_TAIL_REMINDER,
         ])
+        lines.extend(self._build_recency_zone(stage_name="html_code"))
         return lines
 
     # ------------------------------------------------------------------
@@ -738,9 +847,8 @@ class LoopController:
             "- Do NOT use escapeHtml() when setting input.value or textarea.value (plain text, not HTML)",
             "  Only use escapeHtml() inside innerHTML or template literals",
             "",
-            "Call create_file with relative_path='script.js' and the full JS content.",
-            STAGE_TAIL_REMINDER,
         ])
+        lines.extend(self._build_recency_zone(stage_name="js_code"))
         return lines
 
     # ------------------------------------------------------------------
@@ -837,9 +945,8 @@ class LoopController:
             "- Do NOT define .is-open, .is-hidden, or any non-standard toggle classes",
             "- Every class in HTML and JS must have a corresponding CSS rule",
             "",
-            "Call create_file with relative_path='styles.css' and the full CSS content.",
-            STAGE_TAIL_REMINDER,
         ])
+        lines.extend(self._build_recency_zone(stage_name="css_code"))
         return lines
 
     # ------------------------------------------------------------------
@@ -1219,6 +1326,7 @@ class LoopController:
             err_msg = str(err)
             if "XML syntax error" in err_msg or "unexpected end element" in err_msg:
                 self._emit_reasoning(stage_name, "Model returned malformed XML, retrying without tools...")
+                self._current_stage_info.setdefault("errors", []).append("XML parse error — retried without tools")
                 try:
                     response = self.ollama_client.chat(
                         model=self.model_name,
@@ -1240,6 +1348,7 @@ class LoopController:
                 # Server-side crash — often caused by context overflow. Retry with
                 # a truncated message list (system + last 6 messages) and no ctx override.
                 self._emit_reasoning(stage_name, "Server error (500), retrying with reduced context...")
+                self._current_stage_info.setdefault("errors", []).append("HTTP 500 — retried with reduced context")
                 system_msgs = [m for m in memory.messages if m.get("role") == "system"]
                 recent_msgs = [m for m in memory.messages if m.get("role") != "system"][-6:]
                 try:
@@ -1323,6 +1432,7 @@ class LoopController:
                     "or write the required output file."
                 )
                 memory.add("user", nudge)
+                self._current_stage_info["nudges"] = self._current_stage_info.get("nudges", 0) + 1
                 continue
 
             # Emit reasoning
@@ -1448,6 +1558,7 @@ class LoopController:
                         f"and the full file content. Do not output JSON or descriptions — "
                         f"call the tool.",
                     )
+                    self._current_stage_info["nudges"] = self._current_stage_info.get("nudges", 0) + 1
                     continue
                 break
 
@@ -2271,23 +2382,26 @@ class LoopController:
         tail = memory.messages[-keep_tail:]
 
         plan_content = self._read_plan_md()
-        plan_msgs: list[dict[str, Any]] = []
-        if plan_content.strip():
-            plan_msgs = [{
+        chat_content = self._read_chat_md()
+        offload_msgs: list[dict[str, Any]] = []
+        if chat_content.strip():
+            offload_msgs.append({
                 "role": "user",
-                "content": (
-                    "[PLAN.md — project reference, read this for full context]\n"
-                    + plan_content
-                ),
-            }]
+                "content": "[CHAT.md — compressed conversation history]\n" + chat_content,
+            })
+        if plan_content.strip():
+            offload_msgs.append({
+                "role": "user",
+                "content": "[PLAN.md — project reference, element IDs, class names, build status]\n" + plan_content,
+            })
 
         estimated_tokens = total_chars // 3
         self._emit_reasoning_raw(
             "system",
             f"Context {level}: {estimated_tokens:,} tokens estimated "
-            f"(budget 200k). Keeping PLAN.md + last {keep_tail} messages.",
+            f"(budget 200k). Keeping CHAT.md + PLAN.md + last {keep_tail} messages.",
         )
-        return system_msgs + plan_msgs + tail
+        return system_msgs + offload_msgs + tail
 
     # ------------------------------------------------------------------
     # PLAN.md — workspace-level project reference file
@@ -2296,9 +2410,96 @@ class LoopController:
     def _plan_md_path(self) -> Path:
         return self.workspace_root_path / "PLAN.md"
 
+    # ------------------------------------------------------------------
+    # CHAT.md — compressed conversation history offload
+    # ------------------------------------------------------------------
+
+    def _chat_md_path(self) -> Path:
+        return self.workspace_root_path / "CHAT.md"
+
+    def _write_chat_md(self, created_files: set[str]) -> None:
+        """Write a compressed, structured conversation history to CHAT.md.
+
+        Sections match the context-zone structure:
+        - Working memory: per-stage outcomes with primary file status
+        - Errors and nudges: what went wrong and how it was handled
+        - Known issues: stages that exhausted turns without writing output
+
+        This file is read back by _slim_context_for_call when context grows
+        beyond the soft budget, giving the model a concise history without
+        full message list replay.
+        """
+        lines: list[str] = [
+            "# CHAT.md — Compressed Conversation History\n",
+            f"Task: {self._pipeline_task}\n",
+        ]
+
+        if self._stage_summaries:
+            lines.append("## [WORKING MEMORY — Stage Outcomes]")
+            for s in self._stage_summaries:
+                stage = s.get("stage", "?")
+                primary_file = STAGE_PRIMARY_FILE.get(stage)
+                written = s.get("primary_written", False)
+                nudges = s.get("nudges", 0)
+                errors = s.get("errors", [])
+                reasoning = s.get("reasoning_summary", "")
+
+                status = "DONE" if (written or stage == "feature_plan") else "INCOMPLETE"
+                file_note = f" → `{primary_file}` written" if written else (
+                    f" → `{primary_file}` NOT written" if primary_file else ""
+                )
+                line = f"- **{stage}**: {status}{file_note}"
+                if nudges:
+                    line += f" ({nudges} nudge{'s' if nudges > 1 else ''})"
+                lines.append(line)
+
+                if reasoning:
+                    lines.append(f"  - Plan: {reasoning[:200]}")
+                for err in errors:
+                    lines.append(f"  - Error handled: {err}")
+
+            lines.append("")
+
+        all_primary = ["index.html", "script.js", "styles.css"]
+        issues = [f for f in all_primary if f not in created_files]
+        if issues:
+            lines.append("## [KNOWN ISSUES]")
+            for f in issues:
+                lines.append(f"- `{f}` has not been written yet")
+            lines.append("")
+
+        lines.append("## [PREVIOUS ATTEMPTS]")
+        all_errors: list[str] = []
+        for s in self._stage_summaries:
+            for err in s.get("errors", []):
+                all_errors.append(f"- [{s.get('stage', '?')}] {err}")
+        if all_errors:
+            lines.extend(all_errors)
+        else:
+            lines.append("- No errors recorded.")
+        lines.append("")
+
+        lines.append("## [CONTEXT NOTE]")
+        lines.append(
+            "This file is a compressed summary. Full file contents are in PLAN.md. "
+            "Do not re-read files whose content is already visible in this conversation."
+        )
+
+        content = "\n".join(lines)
+        try:
+            self._chat_md_path().write_text(content, encoding="utf-8")
+        except OSError as exc:
+            self._emit_reasoning_raw("system", f"Warning: could not write CHAT.md: {exc}")
+
     def _read_plan_md(self) -> str:
         try:
             return self._plan_md_path().read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _read_chat_md(self) -> str:
+        try:
+            return self._chat_md_path().read_text(encoding="utf-8", errors="replace")
         except OSError:
             return ""
 

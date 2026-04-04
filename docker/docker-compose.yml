@@ -12,7 +12,7 @@ services:
       - ../.env
     environment:
       OLLAMA_BASE_URL: https://ollama.com
-      ORCHESTRATOR_MODEL: qwen3-coder-next
+      ORCHESTRATOR_MODEL: qwen3.5
       ORCHESTRATOR_AGENT_NUM_CTX: "40000"
       EMBEDDING_MODEL: nomic-embed-text
       WORKSPACE_ROOT: ""

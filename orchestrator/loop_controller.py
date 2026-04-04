@@ -525,25 +525,30 @@ class LoopController:
             f"Deliverable: `{primary_file}` — write the COMPLETE file with create_file.",
             "",
             "## [FOCUS INSTRUCTIONS]",
-            "- Call read_file 'PLAN.md' if you need cross-file references (IDs, classes, build status).",
             "- Use the skill guide above for required patterns and anti-patterns.",
             "- Do NOT re-read files whose content is already visible in this conversation.",
         ]
 
         if stage_name == "html_code":
             lines += [
+                "- Call read_file('PLAN.md') only if you need the current build status.",
                 "- Add/Create button MUST be in a persistent header — not only in empty-state sections.",
                 "- Modals: id='...' class='modal-overlay hidden' (starts hidden).",
             ]
         elif stage_name == "js_code":
             lines += [
-                "- PLAN.md > HTML Element Reference has every ID your JS needs — use it.",
+                "- The HTML ELEMENT REFERENCE section above has every ID your JS needs — use it directly.",
+                "- Do NOT call read_file('index.html') — the compact ref above is sufficient.",
+                "- Call read_file('PLAN.md') only if you need extra details not in the ref above.",
                 "- Track edit state with a module-level variable: let currentEditId = null;",
             ]
         elif stage_name == "css_code":
             lines += [
-                "- PLAN.md > JS Dynamic Classes lists every dynamic class you must style.",
-                "- PLAN.md > HTML Element Reference lists selectors to target.",
+                "- The HTML ELEMENT REFERENCE and JS DYNAMIC CLASSES sections above have everything.",
+                "- DO NOT call read_file('index.html') or read_file('script.js') — reading them wastes",
+                "  turns and bloats context. The compact refs above are sufficient.",
+                "- Call read_file('PLAN.md') ONLY if the compact refs seem incomplete.",
+                "- You have enough information to write styles.css immediately — act now.",
             ]
 
         lines += [
@@ -564,10 +569,23 @@ class LoopController:
                 "- escapeHtml() for innerHTML only — NOT for input.value or textarea.value.",
             ]
 
+        if stage_name == "css_code":
+            action_step1 = (
+                "1. You already have all needed references above (HTML ELEMENT REFERENCE + "
+                "JS DYNAMIC CLASSES). Do NOT read any files. Write styles.css now."
+            )
+        elif stage_name == "js_code":
+            action_step1 = (
+                "1. You already have the HTML ELEMENT REFERENCE above. Do NOT read index.html. "
+                "Write script.js now."
+            )
+        else:
+            action_step1 = "1. Read PLAN.md if you need element IDs or class references (call read_file 'PLAN.md')."
+
         lines += [
             "",
             "## [ACTION INSTRUCTIONS]",
-            "1. Read PLAN.md if you need element IDs or class references (call read_file 'PLAN.md').",
+            action_step1,
             f"2. Call create_file with relative_path='{primary_file}' and the COMPLETE file content.",
             "3. Return plain text only after writing — this signals end of stage.",
             "",
@@ -969,9 +987,10 @@ class LoopController:
             stage_name=stage_name,
         )
 
-        # Read the full script.js so the model has complete context
+        # Read script.js once — injected only on the first iteration prompt to avoid
+        # re-adding 10-15k chars every retry. HTML is not needed for Node.js tests.
         js_content = self._read_workspace_file("script.js")
-        html_content = self._read_workspace_file("index.html")
+        html_content = ""  # not needed for Node.js unit tests
 
         last_test_result: dict[str, Any] | None = None
         tests_passed = False
@@ -1111,9 +1130,6 @@ class LoopController:
                             tests_passed = True
                             self._emit_reasoning(stage_name, "All tests passed.")
 
-                    # Re-read script.js in case the model just updated it
-                    js_content = self._read_workspace_file("script.js")
-
                 tool_trace.append({
                     "iteration": iteration,
                     "stage": stage_name,
@@ -1187,39 +1203,40 @@ class LoopController:
         lines: list[str] = ["=== STAGE: test_code ===", ""]
 
         if created_files:
-            lines.append("Known files: " + ", ".join(sorted(created_files)))
+            # Include explicit workspace-relative paths
+            file_list = ", ".join(f"./{f}" for f in sorted(created_files))
+            lines.append(f"Known files (workspace root): {file_list}")
             lines.append("")
 
-        if skill_text:
+        # Only inject skill guide and js_content on the FIRST iteration to avoid
+        # re-adding 10-15k chars to context on every test retry. On subsequent
+        # iterations the model already has this in its context window.
+        if test_iter == 0:
+            if skill_text:
+                lines.extend([
+                    "=== TEST SKILL GUIDE ===",
+                    skill_text,
+                    "=== END TEST SKILL GUIDE ===",
+                    "",
+                ])
+
             lines.extend([
-                "=== TEST SKILL GUIDE ===",
-                skill_text,
-                "=== END TEST SKILL GUIDE ===",
+                "=== ORIGINAL TASK ===",
+                task,
+                "=== END TASK ===",
                 "",
             ])
 
-        lines.extend([
-            "=== ORIGINAL TASK ===",
-            task,
-            "=== END TASK ===",
-            "",
-        ])
-
-        if html_content:
-            lines.extend([
-                "=== COMPLETED index.html ===",
-                html_content,
-                "=== END index.html ===",
-                "",
-            ])
-
-        if js_content:
-            lines.extend([
-                "=== COMPLETE script.js (full context) ===",
-                js_content,
-                "=== END script.js ===",
-                "",
-            ])
+            # Inject script.js only on first iteration, truncated to avoid context bloat.
+            # HTML is not needed for Node.js tests (no DOM).
+            if js_content:
+                truncated = js_content if len(js_content) <= 5000 else js_content[:5000] + "\n... (truncated)"
+                lines.extend([
+                    "=== script.js (for reference — do NOT copy DOM-dependent code) ===",
+                    truncated,
+                    "=== END script.js ===",
+                    "",
+                ])
 
         if test_iter == 0:
             # First iteration: instruct model to write tests
@@ -1232,7 +1249,7 @@ class LoopController:
                 "3. Use Node.js built-in assert module (require('assert')).",
                 "4. Each test must be a plain function call — no test framework needed.",
                 "5. Extract and test pure functions from script.js where possible.",
-                "   If functions aren't exported, you may redefine the relevant logic inline.",
+                "   If functions aren't exported, redefine the relevant logic inline.",
                 "6. After writing the file, call run_unit_tests with test_file='tests.js'.",
                 "7. You have up to " + str(TEST_STAGE_MAX_ITERATIONS) + " iterations to get all tests passing.",
                 "",
@@ -1240,22 +1257,23 @@ class LoopController:
                 "```",
                 "const assert = require('assert');",
                 "",
-                "// -- test helpers or extracted logic --",
+                "// -- redefine any pure helper logic here (no DOM APIs) --",
                 "",
                 "// Test 1",
                 "assert.strictEqual(someFunction(input), expectedOutput, 'test description');",
                 "",
-                "// Test 2",
-                "assert.ok(anotherCheck, 'another test');",
-                "",
                 "console.log('All tests passed');",
                 "```",
                 "",
-                "IMPORTANT:",
-                "- The file name MUST be 'tests.js' (matches the run_unit_tests validator).",
-                "- Do NOT test DOM/browser APIs — Node.js has no DOM.",
+                "CRITICAL — Node.js has NO DOM. Never use document, window, or any browser API.",
+                "  If script.js has: function escapeHtml(text) { const div = document.createElement('div'); ... }",
+                "  Rewrite it for Node.js in tests.js like this:",
+                "    function escapeHtml(text) {",
+                "      return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')",
+                "                 .replace(/\"/g,'&quot;').replace(/'/g,'&#039;');",
+                "    }",
                 "  Only test pure logic functions (formatters, calculators, state helpers, etc.).",
-                "- Use search_files if you need to confirm file names in the workspace.",
+                "- The file MUST be named 'tests.js' (required by run_unit_tests).",
             ])
         else:
             # Subsequent iterations: show previous result and ask for fixes
@@ -2731,6 +2749,16 @@ class LoopController:
         # Task
         if self._pipeline_task:
             lines.append(f"## Task\n{self._pipeline_task}\n")
+
+        # Explicit file locations — so the agent never needs list_directory or read_file to discover files
+        file_loc_lines = ["## File Locations"]
+        file_loc_lines.append("All files are at workspace root (use relative paths only):")
+        for f in all_primary:
+            status_note = " ✓ written" if f in created_files else " (not yet written)"
+            file_loc_lines.append(f"- `{f}`{status_note}")
+        file_loc_lines.append("")
+        file_loc_lines.append("Use create_file with relative_path='index.html' (no leading ./ or /)")
+        lines.append("\n".join(file_loc_lines) + "\n")
 
         # Features and architecture
         if general_plan_text.strip():

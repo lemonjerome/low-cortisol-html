@@ -186,7 +186,7 @@ Each coding stage injects a dedicated skill guide from `skills/`:
 
 | File | Controls |
 |---|---|
-| `skills/html.md` | Semantic structure, element ID rules, state class contract, modal pattern, required initial `hidden` classes. |
+| `skills/html.md` | Semantic structure, element ID rules, state class contract, modal pattern, required initial `hidden` classes, persistent action button rule (primary add/create must be in the header — never only inside a conditional empty-state section). |
 | `skills/js.md` | Modal toggle pattern (`hidden` only), edit-state tracking, event delegation, `escapeHtml` usage rules. |
 | `skills/css.md` | Color palette selection (Uncodixify), button classes, dynamic element styles, `.hidden` rule, banned anti-patterns. |
 | `skills/test.md` | Node.js `assert`-only tests, what to test and what not to test. |
